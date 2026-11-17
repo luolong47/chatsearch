@@ -28,7 +28,7 @@ from .config import (
     WORKBUDDY_PROJECTS,
     ensure_data_dir,
 )
-from .cdp import reload_workbuddy
+from .cdp import reload_dsh, reload_workbuddy
 from .models import Session
 from .parsers import (
     parse_all,
@@ -1044,7 +1044,18 @@ def unarchive_session(key: str) -> dict:
             hint = "WorkBuddy 中已是未归档状态，已刷新本地索引。"
     elif source == "dsh":
         result = _unarchive_dsh(sid)
-        hint = "已从 DSH 归档列表移除。请重启 DeepSeek Harness 查看。"
+        if result.get("ok") and result.get("changed"):
+            # DSH 的归档列表由 host 进程持有，改文件后要让界面重新拉一次
+            ui = reload_dsh()
+            result["ui_refresh"] = ui
+            hint = (
+                "已从 DSH 归档列表移除，并重载了它的界面：归档目录里已看不到该会话。"
+                if ui.get("ok") else
+                "已从 DSH 归档列表移除；自动重载界面失败（DSH 未带调试端口启动），"
+                "重启 DeepSeek Harness 后生效。"
+            )
+        else:
+            hint = "DSH 中已是未归档状态，已刷新本地索引。"
     else:
         return {"ok": False, "error": f"不支持的来源：{source}"}
 

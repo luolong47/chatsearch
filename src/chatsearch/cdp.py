@@ -1,8 +1,15 @@
-"""极简 CDP 客户端：只做「重载 WorkBuddy 渲染进程」这一件事。
+"""极简 CDP 客户端：重载 Electron 应用的渲染进程。
 
-为什么需要它：WorkBuddy 的侧边栏会话列表是渲染进程启动/操作时拉取的，
-外部直接改 `workbuddy.db` 后它不会自己重查，用户必须重启应用才看得到。
-Electron 默认开着本地调试端口（9222），重载渲染进程即可让它重新拉列表。
+为什么需要它：两个数据源的界面都不监听底层存储的变更——
+
+- WorkBuddy：侧边栏会话列表是渲染进程启动/操作时拉取的，外部改 `workbuddy.db`
+  后不会自己重查；
+- DeepSeek Harness：归档列表来自 host 进程读取的 `storages/workspace.json`，
+  外部改完需要界面重新拉一次。
+
+两者都是 Electron，本地开着调试端口时重载渲染进程即可，不必重启整个应用。
+WorkBuddy 固定 9222；DSH 用 `--remote-debugging-port=0` 随机分配，实际端口写在
+`%APPDATA%\\@deepseek-ai\\dsh-desktop\\DevToolsActivePort` 的首行。
 
 只依赖标准库：手写 WebSocket 握手 + 单帧收发（CDP 消息都很小）。
 """
@@ -14,12 +21,26 @@ import json
 import os
 import socket
 import struct
+from pathlib import Path
+from typing import Callable
 from urllib.parse import urlparse
 from urllib.request import urlopen
+
+from .config import DSH_DEVTOOLS_FILE
 
 DEFAULT_CDP_PORT = 9222
 _GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 _LIST_SELECTOR = ".conversation-list-body-host"
+
+
+def read_devtools_port(devtools_file: Path = DSH_DEVTOOLS_FILE) -> int | None:
+    """从 Electron 的 DevToolsActivePort 文件读随机分配到的调试端口。"""
+    try:
+        first = devtools_file.read_text(encoding="utf-8", errors="replace").splitlines()[0]
+        port = int(first.strip())
+    except (OSError, ValueError, IndexError):
+        return None
+    return port if 0 < port < 65536 else None
 
 
 def list_pages(port: int = DEFAULT_CDP_PORT, timeout: float = 2.0) -> list[dict]:
@@ -125,25 +146,27 @@ def _eval(sock: socket.socket, expr: str) -> object:
     return (msg.get("result") or {}).get("result", {}).get("value")
 
 
-def reload_workbuddy(port: int = DEFAULT_CDP_PORT, timeout: float = 3.0) -> dict:
-    """重载 WorkBuddy 的会话列表窗口。
-
-    只看 `file://` 且带会话列表容器的页面（设置窗口不动），逐个发送
-    Page.reload。返回 {"ok": bool, "pages": n, "error": str|None}。
-    """
+def _reload_matching(
+    port: int,
+    predicate: Callable[[dict], bool],
+    label: str,
+    selector: str | None = None,
+    timeout: float = 3.0,
+) -> dict:
+    """对命中的页面逐个发 Page.reload，返回 {"ok","pages","error","port"}。"""
     try:
         pages = list_pages(port)
     except Exception as e:  # noqa: BLE001 - 端口未开/被占用都按不可用处理
-        return {"ok": False, "pages": 0, "error": f"调试端口 {port} 不可达：{e}"}
+        return {"ok": False, "pages": 0, "port": port, "error": f"调试端口 {port} 不可达：{e}"}
 
     targets = [
         p for p in pages
         if p.get("type") == "page"
-        and str(p.get("url", "")).startswith("file://")
         and p.get("webSocketDebuggerUrl")
+        and predicate(p)
     ]
     if not targets:
-        return {"ok": False, "pages": 0, "error": "没有找到 WorkBuddy 渲染窗口"}
+        return {"ok": False, "pages": 0, "port": port, "error": f"没有找到{label}"}
 
     reloaded = 0
     last_error = None
@@ -151,8 +174,8 @@ def reload_workbuddy(port: int = DEFAULT_CDP_PORT, timeout: float = 3.0) -> dict
         sock = None
         try:
             sock = _ws_open(target["webSocketDebuggerUrl"], timeout=timeout)
-            if not _eval(sock, f"!!document.querySelector('{_LIST_SELECTOR}')"):
-                continue  # 不是会话列表窗口（比如设置页）
+            if selector and not _eval(sock, f"!!document.querySelector('{selector}')"):
+                continue  # 不是目标窗口（比如设置页）
             _ws_send(sock, json.dumps({
                 "id": 2,
                 "method": "Page.reload",
@@ -170,5 +193,40 @@ def reload_workbuddy(port: int = DEFAULT_CDP_PORT, timeout: float = 3.0) -> dict
                     pass
 
     if reloaded:
-        return {"ok": True, "pages": reloaded, "error": None}
-    return {"ok": False, "pages": 0, "error": last_error or "没有可重载的会话列表窗口"}
+        return {"ok": True, "pages": reloaded, "port": port, "error": None}
+    return {"ok": False, "pages": 0, "port": port, "error": last_error or f"没有可重载的{label}"}
+
+
+def reload_workbuddy(port: int | None = None, timeout: float = 3.0) -> dict:
+    """重载 WorkBuddy 的会话列表窗口（只看 file:// 且带列表容器的页面）。"""
+    return _reload_matching(
+        port or DEFAULT_CDP_PORT,
+        lambda p: str(p.get("url", "")).startswith("file://"),
+        "WorkBuddy 渲染窗口",
+        _LIST_SELECTOR,
+        timeout,
+    )
+
+
+def reload_dsh(port: int | None = None, timeout: float = 3.0) -> dict:
+    """重载 DeepSeek Harness 的主窗口。
+
+    端口来源优先用 DevToolsActivePort（快捷方式带 --remote-debugging-port=0 才会生成）；
+    没有该文件说明 DSH 是用旧方式启动的，只能重启应用。
+    """
+    if port is None:
+        port = read_devtools_port()
+        if port is None:
+            return {
+                "ok": False,
+                "pages": 0,
+                "port": None,
+                "error": "未发现 DSH 调试端口（DevToolsActivePort 不存在，可能是未带调试参数启动）",
+            }
+    return _reload_matching(
+        port,
+        lambda p: str(p.get("url", "")).startswith("dsh-app://"),
+        "DSH 主窗口",
+        None,
+        timeout,
+    )

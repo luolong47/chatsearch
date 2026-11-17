@@ -18,6 +18,11 @@ DSH_SESSIONS = HOME / ".dsh" / "sessions"
 DSH_STORAGES = HOME / ".dsh" / "storages"
 DSH_WORKSPACE_JSON = DSH_STORAGES / "workspace.json"
 
+# DSH 桌面端（Electron）的 userData 目录。快捷方式带 --remote-debugging-port=0
+# 启动时，Electron 会把随机分配的调试端口写进 DevToolsActivePort 的首行。
+DSH_DESKTOP_USER_DATA = Path(os.environ.get("APPDATA") or HOME) / "@deepseek-ai" / "dsh-desktop"
+DSH_DEVTOOLS_FILE = DSH_DESKTOP_USER_DATA / "DevToolsActivePort"
+
 # 索引数据库存放位置
 # 源码运行：项目根；PyInstaller 打包：exe 所在目录（便于 scoop persist 接管）
 if getattr(sys, "frozen", False):

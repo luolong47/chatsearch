@@ -148,7 +148,7 @@ def _port_in_use(host: str, port: int) -> bool:
 _CLSID_SHELLLINK = "{00021401-0000-0000-C000-000000000046}"
 _IID_ISHELLLINKW = "{000214F9-0000-0000-C000-000000000046}"
 _IID_IPERSISTFILE = "{0000010B-0000-0000-C000-000000000046}"
-SHORTCUT_NAME = "聊天记录检索.lnk"
+SHORTCUT_NAME = "chatsearch.lnk"
 
 
 def _guid_struct(text: str):
