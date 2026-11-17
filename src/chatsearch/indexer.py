@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -263,7 +264,19 @@ def _insert_session_into_index(con: sqlite3.Connection, s: Session) -> None:
         )
 
 
+# watcher 线程与 HTTP 请求线程（maybe_sync_on_search）可能同时触发同步。
+# 首次全量建索引时两者都读到"files 表为空"，会并发走 _build_full，
+# 同一 session 被插入两次 → UNIQUE constraint failed: sessions.key。串行化即可根除。
+_SYNC_LOCK = threading.RLock()
+
+
 def sync_index() -> dict:
+    """增量同步（串行化入口）。"""
+    with _SYNC_LOCK:
+        return _sync_index_locked()
+
+
+def _sync_index_locked() -> dict:
     """增量同步：只处理新增 / 修改 / 删除的源文件。返回统计信息。"""
     ensure_data_dir()
     current = _source_files()
@@ -437,6 +450,12 @@ def _build_full(con: sqlite3.Connection, current: dict[str, tuple[int, int]]) ->
 
 
 def rebuild_index(force: bool = False) -> dict:
+    """强制全量重建（串行化入口）。"""
+    with _SYNC_LOCK:
+        return _rebuild_index_locked(force)
+
+
+def _rebuild_index_locked(force: bool = False) -> dict:
     """强制全量重建（兼容旧调用）。
 
     force=False 时若签名未变则跳过；日常请用 sync_index() 做增量。

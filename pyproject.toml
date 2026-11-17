@@ -21,3 +21,8 @@ packages = ["src/chatsearch"]
 
 [tool.uv]
 python-preference = "only-system"
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.22.3",
+]

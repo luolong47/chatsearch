@@ -27,6 +27,15 @@ Windows 上更懒的办法：装好 uv 后直接双击仓库里的 **`启动聊�
 uv run python -m chatsearch.app
 ```
 
+### 用 Scoop 装（免 Python 环境）
+
+```powershell
+scoop bucket add myapps https://github.com/luolong47/myapps
+scoop install myapps/chatsearch
+```
+
+装的是打包好的单文件 exe，不需要 Python / uv。索引数据放在 scoop 的 `persist` 目录，升级不会丢。
+
 ---
 
 ## 它读哪些文件
@@ -98,6 +107,19 @@ Win11 默认把新图标塞进 `^` 隐藏区。程序启动时会自动写注册
 
 **支持 macOS / Linux？**
 核心检索和网页界面是跨平台的；托盘和开机自启是 Windows 专用实现（纯 Win32），其他平台用 `chatsearch.app` 起网页即可。
+
+---
+
+## 自己打包
+
+```powershell
+uv sync
+pwsh -File build.ps1
+```
+
+产物为 `dist\chatsearch.exe`：单文件、无控制台（`--windowed`），可直接拷到任意目录运行，`data\` 会自动建在 exe 同级。
+
+打包版与源码版的入口一致：不带参数起托盘，`chatsearch.exe app --port 9000` 只开网页。
 
 ---
 

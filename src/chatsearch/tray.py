@@ -73,6 +73,25 @@ def export_icons(force: bool = False) -> Path:
 AUTOSTART_VBS_NAME = "ChatSearchTray.vbs"
 
 
+def _launcher_exe() -> Path:
+    """要启动的可执行文件：打包后就是 exe 自身，源码运行时用同目录 pythonw。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable)
+    exe = Path(sys.executable)
+    if exe.name.lower() != "pythonw.exe":
+        cand = exe.with_name("pythonw.exe")
+        if cand.exists():
+            return cand
+    return exe
+
+
+def _launcher_args() -> list[str]:
+    """启动参数：打包后入口已是托盘，源码运行才需要 -m chatsearch.tray。"""
+    if getattr(sys, "frozen", False):
+        return []
+    return ["-m", "chatsearch.tray"]
+
+
 def _startup_dir() -> Path:
     appdata = os.environ.get("APPDATA")
     base = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
@@ -98,11 +117,8 @@ def set_autostart(enable: bool) -> tuple[bool, str]:
             if path.exists():
                 path.unlink()
             return True, "已关闭开机自启"
-        exe = Path(sys.executable)
-        if exe.name.lower() != "pythonw.exe":
-            cand = exe.with_name("pythonw.exe")
-            if cand.exists():
-                exe = cand
+        exe = _launcher_exe()
+        args = " ".join(_launcher_args() + ["--no-browser"])
         path.parent.mkdir(parents=True, exist_ok=True)
         # WSH 按 Unicode(UTF-16 LE + BOM) 读取，中文注释与含中文的路径都不会乱码
         # newline="\r\n" 显式指定，避免 text mode 把 \r\n 二次转义成 \r\r\n
@@ -111,7 +127,7 @@ def set_autostart(enable: bool) -> tuple[bool, str]:
             "' Written by tray menu. Uncheck it there to remove.",
             'Set sh = CreateObject("WScript.Shell")',
             f'sh.CurrentDirectory = "{PROJECT_ROOT}"',
-            f'sh.Run """{exe}"" -m chatsearch.tray --no-browser", 0, False',
+            f'sh.Run """{exe}"" {args}", 0, False',
             "",
         ))
         path.write_text(body, encoding="utf-16", newline="\r\n")
@@ -181,12 +197,7 @@ def _desktop_dir() -> Path:
 
 
 def _pythonw() -> Path:
-    exe = Path(sys.executable)
-    if exe.name.lower() != "pythonw.exe":
-        cand = exe.with_name("pythonw.exe")
-        if cand.exists():
-            return cand
-    return exe
+    return _launcher_exe()
 
 
 def create_desktop_shortcut() -> tuple[bool, str]:
@@ -218,8 +229,8 @@ def create_desktop_shortcut() -> tuple[bool, str]:
         set_icon = _com_method(p_sl, 17, c_int, wintypes.LPCWSTR, c_int)
         release_sl = _com_method(p_sl, 2, ctypes.c_ulong)
 
-        set_path(p_sl, str(_pythonw()))
-        set_args(p_sl, "-m chatsearch.tray")
+        set_path(p_sl, str(_launcher_exe()))
+        set_args(p_sl, " ".join(_launcher_args()))
         set_wd(p_sl, str(PROJECT_ROOT))
         set_icon(p_sl, str(icon_path(True)), 0)
         set_desc(p_sl, "本地聊天记录全文检索（WorkBuddy / DSH）")

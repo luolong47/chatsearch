@@ -12,7 +12,15 @@ from urllib.parse import parse_qs, urlparse
 from . import indexer, watcher
 from .config import DEFAULT_HOST, DEFAULT_PORT
 
-STATIC_DIR = Path(__file__).resolve().parent / "static"
+def _resolve_static_dir() -> Path:
+    """静态资源目录：源码运行取包内 static；PyInstaller 单文件取解包目录。"""
+    if getattr(sys, "frozen", False):
+        base = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+        return base / "chatsearch" / "static"
+    return Path(__file__).resolve().parent / "static"
+
+
+STATIC_DIR = _resolve_static_dir()
 
 
 def _parse_archived(qs: dict) -> bool | None:

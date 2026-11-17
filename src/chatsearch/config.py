@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 HOME = Path.home()
@@ -17,8 +18,12 @@ DSH_SESSIONS = HOME / ".dsh" / "sessions"
 DSH_STORAGES = HOME / ".dsh" / "storages"
 DSH_WORKSPACE_JSON = DSH_STORAGES / "workspace.json"
 
-# 索引数据库存放位置（本工作区）
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+# 索引数据库存放位置
+# 源码运行：项目根；PyInstaller 打包：exe 所在目录（便于 scoop persist 接管）
+if getattr(sys, "frozen", False):
+    PROJECT_ROOT = Path(sys.executable).resolve().parent
+else:
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 INDEX_DB = DATA_DIR / "index.sqlite3"
 
