@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# 虚拟环境
+.venv/
+venv/
+
+# 运行时数据（索引库很大，日志会持续增长，均不入库）
+data/index.sqlite3
+data/index.sqlite3-*
+data/tray.log
+data/backups/
+data/*.ico
+
+# 工作区内部记录
+.workbuddy/
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini

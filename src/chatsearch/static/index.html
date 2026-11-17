@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>聊天记录检索 · ChatSearch</title>
+<link rel="stylesheet" href="/github-markdown-dark.css" id="md-dark">
+<link rel="stylesheet" href="/github-markdown-light.css" id="md-light" disabled>
+<link rel="stylesheet" href="/github-dark.min.css" id="hl-dark">
+<link rel="stylesheet" href="/github-light.min.css" id="hl-light" disabled>
+<link rel="stylesheet" href="/style.css">
+<script>
+  // 首屏渲染前应用主题，避免闪烁
+  (function () {
+    var t = localStorage.getItem('chatsearch-theme') || 'dark';
+    if (t !== 'light') t = 'dark';
+    document.documentElement.setAttribute('data-theme', t);
+    var light = t === 'light';
+    ['md-dark', 'hl-dark'].forEach(function (id) { var e = document.getElementById(id); if (e) e.disabled = light; });
+    ['md-light', 'hl-light'].forEach(function (id) { var e = document.getElementById(id); if (e) e.disabled = !light; });
+  })();
+</script>
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">⌕</span>
+      <span class="brand-name">ChatSearch</span>
+      <span class="brand-sub">全文检索 WorkBuddy &amp; DeepSeek Harness</span>
+    </div>
+    <div class="topbar-actions">
+      <span id="index-status" class="index-status">索引加载中…</span>
+      <button id="theme-toggle" class="theme-toggle" title="切换深色 / 浅色主题" aria-label="切换主题">
+        <span class="icon-moon">🌙</span><span class="icon-sun">☀️</span>
+      </button>
+      <button id="rebuild-btn" class="ghost-btn" title="增量更新：只处理新增或变化的会话，通常不到 1 秒">更新索引</button>
+    </div>
+  </header>
+
+  <section class="search-panel">
+    <div class="search-box">
+      <span class="search-icon">⌕</span>
+      <input id="q" type="text" autocomplete="off" spellcheck="false"
+             placeholder="搜索聊天记录… 支持中文 / 英文 / 代码片段，回车检索">
+      <button id="clear-btn" class="clear-btn" title="清空">×</button>
+    </div>
+    <div class="filters">
+      <button class="chip active" data-source="all">全部来源</button>
+      <button class="chip" data-source="workbuddy"><i class="dot dot-wb"></i>WorkBuddy</button>
+      <button class="chip" data-source="dsh"><i class="dot dot-dsh"></i>DeepSeek Harness</button>
+      <span class="filter-sep"></span>
+      <button class="chip active" data-archived="all">全部状态</button>
+      <button class="chip" data-archived="active">未归档</button>
+      <button class="chip" data-archived="archived">已归档</button>
+      <span class="filter-sep"></span>
+      <input id="cwd-filter" class="cwd-input" type="text" list="cwd-options"
+             placeholder="工作目录（全部）" autocomplete="off" spellcheck="false">
+      <datalist id="cwd-options"></datalist>
+      <button id="cwd-clear" class="cwd-clear" title="清除工作目录筛选">×</button>
+      <span class="hint" id="result-hint"></span>
+    </div>
+  </section>
+
+  <div class="workspace-layout">
+    <aside class="workspace-sidebar" id="workspace-sidebar">
+      <div class="ws-head">
+        <span>工作区</span>
+        <span class="ws-count" id="ws-count"></span>
+      </div>
+      <div class="ws-list" id="workspace-list"></div>
+    </aside>
+
+    <main class="content">
+      <div id="empty" class="empty-state">
+        <div class="empty-illustration">⌕</div>
+        <h2>浏览或搜索聊天记录</h2>
+        <p>从左侧选择工作区查看全部会话，或输入关键词跨工作区检索。</p>
+        <div class="tip-row">
+          <span class="tip">试试输入一个项目名、报错信息，或一句你说过的话</span>
+        </div>
+      </div>
+
+      <div id="results" class="results hidden">
+        <div id="result-list" class="result-list"></div>
+      </div>
+    </main>
+  </div>
+</div>
+
+<!-- 会话时间线抽屉 -->
+<div id="drawer-mask" class="drawer-mask hidden"></div>
+<aside id="drawer" class="drawer hidden">
+  <div class="drawer-head">
+    <div class="drawer-title-wrap">
+      <span id="drawer-source" class="src-badge"></span>
+      <h2 id="drawer-title"></h2>
+    </div>
+    <div class="drawer-meta" id="drawer-meta"></div>
+    <button id="drawer-close" class="close-btn" title="关闭">×</button>
+  </div>
+  <div class="drawer-main">
+    <div id="msg-nav" class="msg-nav hidden" title="消息导航 · 点击刻度快速定位"></div>
+    <div id="drawer-body" class="drawer-body"></div>
+  </div>
+</aside>
+
+<script src="/marked.min.js"></script>
+<script src="/highlight.min.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>
