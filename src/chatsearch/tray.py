@@ -22,7 +22,7 @@ from PIL import Image, ImageDraw
 
 from . import app as appmod
 from . import watcher
-from .config import DATA_DIR, DEFAULT_HOST, DEFAULT_PORT, PROJECT_ROOT
+from .config import DATA_DIR, DEFAULT_HOST, DEFAULT_PORT, PROJECT_ROOT, stable_exe_path
 from .traywin import TrayThread
 
 URL = f"http://{DEFAULT_HOST}:{DEFAULT_PORT}"
@@ -76,7 +76,7 @@ AUTOSTART_VBS_NAME = "ChatSearchTray.vbs"
 def _launcher_exe() -> Path:
     """要启动的可执行文件：打包后就是 exe 自身，源码运行时用同目录 pythonw。"""
     if getattr(sys, "frozen", False):
-        return Path(sys.executable)
+        return stable_exe_path(Path(sys.executable))
     exe = Path(sys.executable)
     if exe.name.lower() != "pythonw.exe":
         cand = exe.with_name("pythonw.exe")

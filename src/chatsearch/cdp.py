@@ -136,11 +136,15 @@ def _ws_recv(sock: socket.socket) -> str:
             return data.decode("utf-8", "replace")
 
 
-def _eval(sock: socket.socket, expr: str) -> object:
+def _eval(sock: socket.socket, expr: str, await_promise: bool = False) -> object:
     _ws_send(sock, json.dumps({
         "id": 1,
         "method": "Runtime.evaluate",
-        "params": {"expression": expr, "returnByValue": True},
+        "params": {
+            "expression": expr,
+            "returnByValue": True,
+            "awaitPromise": await_promise,
+        },
     }))
     msg = json.loads(_ws_recv(sock))
     return (msg.get("result") or {}).get("result", {}).get("value")
@@ -209,10 +213,14 @@ def reload_workbuddy(port: int | None = None, timeout: float = 3.0) -> dict:
 
 
 def reload_dsh(port: int | None = None, timeout: float = 3.0) -> dict:
-    """重载 DeepSeek Harness 的主窗口。
+    """重载 DeepSeek Harness 的渲染进程（**不足以刷新归档状态**）。
 
     端口来源优先用 DevToolsActivePort（快捷方式带 --remote-debugging-port=0 才会生成）；
-    没有该文件说明 DSH 是用旧方式启动的，只能重启应用。
+    没有该文件说明 DSH 是用旧方式启动的。
+
+    实测结论（0.2.2-rc.3）：取消归档后重载界面无效 —— 归档列表由 host 进程在内存里
+    持有，渲染进程重载后向 host 请求到的仍是旧列表，只有重启应用才会重读
+    storages/workspace.json。保留此函数是为了其它需要让界面重绘的场景。
     """
     if port is None:
         port = read_devtools_port()

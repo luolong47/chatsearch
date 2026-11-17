@@ -23,10 +23,25 @@ DSH_WORKSPACE_JSON = DSH_STORAGES / "workspace.json"
 DSH_DESKTOP_USER_DATA = Path(os.environ.get("APPDATA") or HOME) / "@deepseek-ai" / "dsh-desktop"
 DSH_DEVTOOLS_FILE = DSH_DESKTOP_USER_DATA / "DevToolsActivePort"
 
+def stable_exe_path(exe: Path) -> Path:
+    """scoop 布局下把 apps/<app>/<version>/x.exe 归一化为 apps/<app>/current/x.exe。
+
+    scoop 升级后会删掉旧版本目录，写死版本路径的快捷方式 / 自启脚本会失效。
+    """
+    try:
+        current = exe.parent.parent / "current"
+        cand = current / exe.name
+        if current.is_dir() and cand.is_file():
+            return cand
+    except OSError:
+        pass
+    return exe
+
+
 # 索引数据库存放位置
 # 源码运行：项目根；PyInstaller 打包：exe 所在目录（便于 scoop persist 接管）
 if getattr(sys, "frozen", False):
-    PROJECT_ROOT = Path(sys.executable).resolve().parent
+    PROJECT_ROOT = stable_exe_path(Path(sys.executable)).parent
 else:
     PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
