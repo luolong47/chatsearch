@@ -366,8 +366,13 @@
       const unarchiveBtn = s.archived
         ? ` <button class="unarchive-btn" data-act="unarchive" title="从原生应用恢复为未归档（写前自动备份）">取消归档</button>`
         : "";
+      // 跨 App 同步：把这条会话复制到另一端的原生存储
+      const otherLabel = s.source === "workbuddy" ? "DSH" : "WorkBuddy";
+      const migrateTarget = s.source === "workbuddy" ? "dsh" : "workbuddy";
+      const migrateBtn = ` <button class="migrate-btn" data-act="migrate" data-target="${migrateTarget}"`
+        + ` title="把这条会话复制到 ${otherLabel}（只搬文本对话，写前自动备份）">同步到 ${otherLabel}</button>`;
       const stat = `共 ${s.messages.length} 条消息 · ${fmtTime(s.created_at)} — ${fmtTime(s.updated_at)}` +
-        (s.archived ? ' <span class="arc-badge">已归档</span>' : "") + unarchiveBtn;
+        (s.archived ? ' <span class="arc-badge">已归档</span>' : "") + unarchiveBtn + migrateBtn;
       const cwdLine = s.cwd
         ? `<div class="cwd-line" id="cwd-line" title="点击复制完整路径">
              <span class="cwd-label">工作目录</span>
@@ -515,6 +520,10 @@
       await doUnarchive(btn);
       return;
     }
+    if (act === "migrate") {
+      await doMigrate(btn);
+      return;
+    }
     const path = currentCwdReal;
     if (!path) { toast("路径不可用"); return; }
     if (act === "copy-cwd") {
@@ -561,7 +570,7 @@
     const ok = confirm(
       "确定取消归档吗？\n\n" +
       "会直接写入 WorkBuddy 数据库或 DSH 配置（写前自动备份）。\n" +
-      "WorkBuddy 会自动重载界面；DSH 需重启后才能看到。"
+      "WorkBuddy 会自动重载界面；DSH 会在它自己的界面里完成取消归档，状态立即生效。"
     );
     if (!ok) return;
     const label = btn ? btn.textContent : "";
@@ -578,8 +587,47 @@
     }
   }
 
-  q.addEventListener("input", () => {
-    clearTimeout(debounceTimer);
+  // 跨 App 同步：把当前会话复制到另一端原生存储（只搬文本对话，写前自动备份）
+  async function doMigrate(btn) {
+    const key = $("drawer-meta").dataset.key;
+    if (!key) return;
+    const target = btn.dataset.target;
+    const label = target === "dsh" ? "DeepSeek Harness" : "WorkBuddy";
+    const ok = confirm(
+      `把这条会话复制到 ${label}？\n\n` +
+      "只搬文本对话（你的提问 + AI 回复），不含工具调用、推理过程和附件。\n" +
+      `会写入 ${label} 的原生存储（写前自动备份）；原会话保持不变。`
+    );
+    if (!ok) return;
+    const raw = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "同步中…";
+    try {
+      const r = await api(
+        `/api/migrate?key=${encodeURIComponent(key)}&target=${encodeURIComponent(target)}`,
+        { method: "POST" }
+      );
+      let msg;
+      if (target === "dsh") {
+        msg = `已同步到 DSH：${r.messages} 条消息。重启 DSH 后可在会话列表看到它。`;
+      } else {
+        const refreshed = r.ui_refresh && r.ui_refresh.ok;
+        msg = `已同步到 WorkBuddy：${r.messages} 条消息。` +
+          (refreshed ? "已重载它的界面，侧边栏「最近」顶部可见。" : "重开 WorkBuddy 窗口即可看到。");
+      }
+      toast(msg, 7000);
+      await loadStatus();
+      await loadFilters();
+      if (q.value.trim()) doSearch(); else if (currentCwd) browse(); else browse();
+    } catch (err) {
+      toast(`同步失败：${err.message}`, 7000);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = raw;
+    }
+  }
+
+  q.addEventListener("input", () => {    clearTimeout(debounceTimer);
     debounceTimer = setTimeout(doSearch, 280);
   });
   q.addEventListener("keydown", (e) => {

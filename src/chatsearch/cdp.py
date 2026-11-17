@@ -150,6 +150,29 @@ def _eval(sock: socket.socket, expr: str, await_promise: bool = False) -> object
     return (msg.get("result") or {}).get("result", {}).get("value")
 
 
+def _eval_value(sock: socket.socket, expr: str, await_promise: bool = True) -> object:
+    """Runtime.evaluate 并返回真正的值；页面抛异常时上抛，避免"静默成功"。"""
+    _ws_send(sock, json.dumps({
+        "id": 1,
+        "method": "Runtime.evaluate",
+        "params": {
+            "expression": expr,
+            "returnByValue": True,
+            "awaitPromise": await_promise,
+            "userGesture": True,
+        },
+    }))
+    msg = json.loads(_ws_recv(sock))
+    if msg.get("error"):
+        raise RuntimeError(f"CDP 错误：{msg['error'].get('message')}")
+    result = msg.get("result") or {}
+    if result.get("exceptionDetails"):
+        d = result["exceptionDetails"]
+        desc = (d.get("exception") or {}).get("description") or d.get("text") or "未知异常"
+        raise RuntimeError(f"页面脚本异常：{str(desc).splitlines()[0]}")
+    return (result.get("result") or {}).get("value")
+
+
 def _reload_matching(
     port: int,
     predicate: Callable[[dict], bool],
@@ -238,3 +261,149 @@ def reload_dsh(port: int | None = None, timeout: float = 3.0) -> dict:
         None,
         timeout,
     )
+
+
+# 在 DSH 自己的界面里点「取消归档」，让 host 进程自己改状态并广播给界面。
+# 走 UI 是唯一能做到"立刻生效"的路径：直接改 workspace.json 时，host 内存里的
+# 归档集合不会重读，界面也不监听文件，必须重启。
+_DSH_UNARCHIVE_JS = """
+(async () => {
+  const SID = __SID__;
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const all = (sel) => [...document.querySelectorAll(sel)];
+  const btnByLabel = (l) => all('button').find((b) => b.getAttribute('aria-label') === l);
+  const menuItem = (t) => all('[role=menuitem],[role=menuitemradio]').find((e) => e.innerText.trim() === t);
+  const rowSel = '[data-row-key="session:session-' + SID + '"]';
+  const row = () => document.querySelector(rowSel);
+  const FILTERS = ['隐藏已归档', '全部对话（显示已归档）', '仅显示已归档'];
+
+  if (!btnByLabel('视图选项')) return { ok: false, err: 'no-view-options' };
+
+  // 1. 切到「仅显示已归档」，同时记下用户原来的过滤方式
+  btnByLabel('视图选项').click();
+  await sleep(250);
+  const cur = all('[role=menuitem]').find(
+    (e) => /selected/i.test(String(e.className)) && FILTERS.includes(e.innerText.trim()));
+  const current = cur ? cur.innerText.trim() : null;
+  menuItem('仅显示已归档')?.click();
+  await sleep(350);
+
+  const restore = async () => {
+    const target = current && current !== '仅显示已归档' ? current : '隐藏已归档';
+    btnByLabel('视图选项')?.click();
+    await sleep(250);
+    menuItem(target)?.click();
+    await sleep(300);
+  };
+
+  // 2. 找到这一行（归档视图里才有）
+  let tries = 0;
+  while (!row() && tries++ < 12) await sleep(120);
+  if (!row()) {
+    await restore();
+    return { ok: false, err: 'not-archived' };
+  }
+
+  // 3. 打开行操作菜单 → 取消归档
+  const trigger = row().querySelector('.wnFoaW_rowActions button');
+  if (!trigger) { await restore(); return { ok: false, err: 'no-row-actions' }; }
+  trigger.click();
+  let act = null;
+  tries = 0;
+  while (!act && tries++ < 10) { await sleep(120); act = menuItem('取消归档'); }
+  if (!act) return { ok: false, err: 'no-unarchive-item' };
+  act.click();
+
+  tries = 0;
+  while (row() && tries++ < 15) await sleep(120);
+  const changed = !row();
+
+  // 4. 还原用户原来的过滤方式
+  await restore();
+  return { ok: true, changed, filter: current, rowSel };
+})()
+"""
+
+
+def unarchive_dsh_via_ui(
+    sid: str,
+    port: int | None = None,
+    timeout: float = 8.0,
+) -> dict:
+    """在 DSH 界面里完成「取消归档」，状态立刻生效（无需重启应用）。
+
+    返回 {"ok","changed","error","port"}：
+    - ok/changed 都为真：确实执行了取消归档，DSH 界面已刷新；
+    - ok 真、changed 假：host 里本来就没归档（幂等）；
+    - ok 假：DSH 没开或没带调试端口，调用方应退化为直接改 workspace.json。
+    """
+    norm = (sid or "").strip()
+    for prefix in ("session:", "session-"):
+        if norm.startswith(prefix):
+            norm = norm[len(prefix):]
+    if not norm:
+        return {"ok": False, "changed": False, "error": "缺少 DSH 会话 id"}
+
+    if port is None:
+        port = read_devtools_port()
+        if port is None:
+            return {
+                "ok": False,
+                "changed": False,
+                "port": None,
+                "error": "未发现 DSH 调试端口（DevToolsActivePort 不存在）",
+            }
+
+    try:
+        pages = list_pages(port)
+    except Exception as e:  # noqa: BLE001 - 端口未开按不可用处理
+        return {"ok": False, "changed": False, "port": port,
+                "error": f"DSH 调试端口 {port} 不可达：{e}"}
+
+    target = next(
+        (
+            p for p in pages
+            if p.get("type") == "page"
+            and p.get("webSocketDebuggerUrl")
+            and str(p.get("url", "")).startswith("dsh-app://")
+        ),
+        None,
+    )
+    if target is None:
+        return {"ok": False, "changed": False, "port": port,
+                "error": "没找到 DSH 主窗口"}
+
+    sock = None
+    try:
+        sock = _ws_open(target["webSocketDebuggerUrl"], timeout=timeout)
+        sock.settimeout(timeout)
+        expr = _DSH_UNARCHIVE_JS.replace("__SID__", json.dumps(norm))
+        value = _eval_value(sock, expr, await_promise=True)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "changed": False, "port": port,
+                "error": f"操作 DSH 界面失败：{e}"}
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    if not isinstance(value, dict):
+        return {"ok": False, "changed": False, "port": port,
+                "error": "DSH 界面返回了异常结果"}
+
+    err = value.get("err")
+    if value.get("ok"):
+        return {
+            "ok": True,
+            "changed": bool(value.get("changed")),
+            "via": "ui",
+            "focus_restored": value.get("filter"),
+            "port": port,
+        }
+    if err == "not-archived":
+        return {"ok": True, "changed": False, "via": "ui", "port": port,
+                "note": "DSH 归档列表里没有该会话"}
+    return {"ok": False, "changed": False, "port": port,
+            "error": f"DSH 界面操作未完成（{err or 'unknown'}）"}

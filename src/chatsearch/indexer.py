@@ -28,7 +28,7 @@ from .config import (
     WORKBUDDY_PROJECTS,
     ensure_data_dir,
 )
-from .cdp import reload_workbuddy
+from .cdp import reload_workbuddy, unarchive_dsh_via_ui
 from .models import Session
 from .parsers import (
     parse_all,
@@ -331,9 +331,11 @@ def _sync_index_locked() -> dict:
                 _delete_session_from_index(con, old_key)
             touched.append(p)
 
-        # 3) 去重用的现有 hash 集合（排除刚被删除的变更会话）
+        # 3) 去重用的现有（来源, 内容）组合
+        # 必须带上 source：同一段对话被迁移到另一端 App 后内容完全相同，
+        # 只按内容去重会把迁移出来的副本整条丢掉（全量构建也是按 source 分的）。
         existing_hashes = {
-            r["dedup_hash"] for r in con.execute("SELECT dedup_hash FROM sessions")
+            (r["source"], r["dedup_hash"]) for r in con.execute("SELECT source, dedup_hash FROM sessions")
             if r["dedup_hash"]
         }
 
@@ -349,11 +351,11 @@ def _sync_index_locked() -> dict:
                     (p, current[p][0], current[p][1]),
                 )
                 continue
-            fp = _session_hash(s)
+            fp = (s.source, _session_hash(s))
             if fp in existing_hashes:
                 # 内容与其他会话重复：跳过入库，但记录文件指纹，避免反复重解析
                 dup_key = con.execute(
-                    "SELECT key FROM sessions WHERE dedup_hash=? LIMIT 1", (fp,)
+                    "SELECT key FROM sessions WHERE dedup_hash=? AND source=? LIMIT 1", (fp[1], fp[0])
                 ).fetchone()
                 con.execute(
                     "INSERT OR REPLACE INTO files(path,mtime_ns,size,session_key) VALUES(?,?,?,?)",
@@ -1043,15 +1045,32 @@ def unarchive_session(key: str) -> dict:
         else:
             hint = "WorkBuddy 中已是未归档状态，已刷新本地索引。"
     elif source == "dsh":
-        result = _unarchive_dsh(sid)
-        # DSH 的归档列表由 host 进程在内存里持有，重载渲染进程拿到的还是旧列表
-        # （实测：Page.reload 后界面无变化），所以只能重启应用才看得到。
-        hint = (
-            "已从 DSH 归档列表移除，重启 DeepSeek Harness 后可见"
-            "（归档状态缓存在它的 host 进程内存里，重载界面不生效）。"
-            if result.get("changed") else
-            "DSH 中已是未归档状态，已刷新本地索引。"
-        )
+        # 优先在 DSH 自己的界面里点「取消归档」：只有走它自己的 RPC，host 进程才会
+        # 同步内存状态并广播给界面，效果是立刻可见。直接改 workspace.json 做不到这点
+        # （host 不重读文件，界面也不监听），只能等重启。
+        ui = unarchive_dsh_via_ui(sid)
+        if ui.get("ok"):
+            result = {
+                "ok": True,
+                "changed": bool(ui.get("changed")),
+                "native_status": "active",
+                "ui_attempt": {k: ui.get(k) for k in ("ok", "changed", "error", "port")},
+            }
+            hint = (
+                "已在 DeepSeek Harness 里取消归档，界面已同步，无需重启。"
+                if ui.get("changed") else
+                "DSH 中已是未归档状态，已刷新本地索引。"
+            )
+        else:
+            # 界面不可用（DSH 没开 / 没带调试端口）→ 退化为直接改文件，需重启才可见
+            result = _unarchive_dsh(sid)
+            result["ui_attempt"] = {k: ui.get(k) for k in ("ok", "changed", "error", "port")}
+            hint = (
+                "已从 DSH 归档列表移除，但 DSH 界面暂时连不上（"
+                f"{ui.get('error') or '未知原因'}），重启 DeepSeek Harness 后可见。"
+                if result.get("changed") else
+                "DSH 中已是未归档状态，已刷新本地索引。"
+            )
     else:
         return {"ok": False, "error": f"不支持的来源：{source}"}
 

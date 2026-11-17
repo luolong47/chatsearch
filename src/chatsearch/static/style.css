@@ -324,6 +324,15 @@ mark {
 }
 .unarchive-btn:hover { filter: brightness(1.1); }
 .unarchive-btn:disabled { opacity: .55; cursor: wait; }
+/* 跨 App 同步按钮：与取消归档同尺寸，配色区分（描边式） */
+.migrate-btn {
+  margin-left: 8px; padding: 2px 9px; font-size: 11px; font-family: inherit;
+  background: transparent; color: var(--accent);
+  border: 1px solid var(--accent); border-radius: 6px; cursor: pointer;
+  vertical-align: middle; transition: .15s;
+}
+.migrate-btn:hover { background: var(--chip-active-bg); }
+.migrate-btn:disabled { opacity: .55; cursor: wait; }
 /* 工作目录：单独一行，可点复制，附文件夹打开按钮 */
 .cwd-line {
   display: flex; align-items: center; gap: 6px;

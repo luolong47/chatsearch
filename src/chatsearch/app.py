@@ -9,7 +9,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from . import indexer, watcher
+from . import indexer, migrate, watcher
 from .config import DEFAULT_HOST, DEFAULT_PORT
 
 def _resolve_static_dir() -> Path:
@@ -132,6 +132,8 @@ class APIHandler(SimpleHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
+        if parsed.path == "/api/migrate":
+            return self._handle_migrate(parsed)
         if parsed.path != "/api/unarchive":
             return self.send_error(404)
         qs = parse_qs(parsed.query)
@@ -145,6 +147,30 @@ class APIHandler(SimpleHTTPRequestHandler):
         if not result.get("ok"):
             status = 404 if "不存在" in (result.get("error") or "") else 400
             return self._send_json(result, status=status)
+        watcher.note_synced()
+        return self._send_json(result)
+
+    def _handle_migrate(self, parsed) -> None:
+        """把一条会话同步到另一端 App（WorkBuddy <-> DSH）。"""
+        qs = parse_qs(parsed.query)
+        key = (qs.get("key", [""])[0] or "").strip()
+        target = (qs.get("target", [""])[0] or "").strip()
+        if not key or target not in ("workbuddy", "dsh"):
+            return self._send_json({"ok": False, "error": "缺少 key 或 target 非法"}, status=400)
+        source, _, sid = key.partition(":")
+        if not sid:
+            return self._send_json({"ok": False, "error": "key 格式不对"}, status=400)
+        try:
+            result = migrate.migrate(source, sid, target)
+        except Exception as e:  # noqa: BLE001
+            return self._send_json({"ok": False, "error": f"{type(e).__name__}: {e}"}, status=500)
+        if not result.get("ok"):
+            return self._send_json(result, status=400)
+        # 新会话已落到原生存储，立刻补一次增量同步，让它出现在检索里
+        try:
+            indexer.sync_index()
+        except Exception:  # noqa: BLE001
+            pass
         watcher.note_synced()
         return self._send_json(result)
 

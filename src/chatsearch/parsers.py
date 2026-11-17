@@ -271,6 +271,7 @@ def parse_dsh_file(path: Path, archived_ids: set[str] | None = None) -> Session 
     # 每个 turn 只产出 1 条 user + 1 条合并后的 assistant，避免把一轮对话
     # 拆成 N 条、信息密度过低。
     turns: dict[int, dict] = {}
+    active_turn = 0  # user/message 事件不带 turn 字段，靠 turn/start 推导当前轮
 
     def _bucket(turn: int) -> dict:
         return turns.setdefault(
@@ -290,6 +291,8 @@ def parse_dsh_file(path: Path, archived_ids: set[str] | None = None) -> Session 
         if typ == "session":
             created = obj.get("createdAt") or created
             cwd = obj.get("cwd", "")
+        elif typ == "turn/start":
+            active_turn = (obj.get("data") or {}).get("turn") or active_turn
         elif typ == "session/title":
             t = (obj.get("data", {}).get("title") or "").strip()
             if t:
@@ -307,7 +310,7 @@ def parse_dsh_file(path: Path, archived_ids: set[str] | None = None) -> Session 
                         parts.append(t)
             text = "\n".join(parts).strip()
             if text:
-                b = _bucket(data.get("turn") or 0)
+                b = _bucket(data.get("turn") or active_turn or 0)
                 b["user"].append(text)
                 if not b["user_ts"]:
                     b["user_ts"] = ts
@@ -322,7 +325,7 @@ def parse_dsh_file(path: Path, archived_ids: set[str] | None = None) -> Session 
                         parts.append(t)
             text = "\n".join(parts).strip()
             if text:
-                b = _bucket(data.get("turn") or 0)
+                b = _bucket(data.get("turn") or active_turn or 0)
                 b["asst"].append(text)  # reasoning / tool-call 已在上层被过滤
                 b["asst_ts"] = ts
                 b["asst_seq"] = obj.get("seq") or b["asst_seq"]
