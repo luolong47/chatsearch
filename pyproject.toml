@@ -1,6 +1,6 @@
 [project]
 name = "chatsearch"
-version = "0.1.0"
+version = "0.3.0"
 description = "本地聊天记录全文检索：统一管理 WorkBuddy 与 DeepSeek Harness 会话"
 requires-python = ">=3.11"
 dependencies = [

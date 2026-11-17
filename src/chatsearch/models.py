@@ -29,6 +29,8 @@ class Session:
     archived: bool = False  # WorkBuddy: sessions.status=='archived'；DSH: workspace.json 的 archivedSessionIds
     created_at: int = 0  # 毫秒
     updated_at: int = 0  # 毫秒
+    native_status: str = ""  # 原生状态：WorkBuddy 的 sessions.status（active/working/completed/archived）
+    last_active: int = 0  # 原生最近活动时间（毫秒），WorkBuddy 的 last_activity_at
 
     @property
     def key(self) -> str:

@@ -57,9 +57,11 @@ def _iter_jsonl(path: Path) -> Iterable[dict]:
 # ---------------------------------------------------------------------------
 
 def _load_wb_meta() -> dict[str, dict]:
-    """从 workbuddy.db sessions 表读取元数据：标题（custom_title > title）与归档状态。
+    """从 workbuddy.db sessions 表读取元数据：标题（custom_title > title）、归档状态、
+    原生 status 与最近活动时间。
 
-    返回 {id: {"title": str, "archived": bool}}。archived = status=='archived'。
+    返回 {id: {"title": str, "archived": bool, "status": str, "last_active": int}}。
+    archived = status=='archived'。status/last_active 用于判定「会话进行中」。
     DSH 会话不在此表，解析时 archived 默认 False。
     """
     meta: dict[str, dict] = {}
@@ -68,12 +70,18 @@ def _load_wb_meta() -> dict[str, dict]:
     try:
         con = sqlite3.connect(f"file:{WORKBUDDY_DB}?mode=ro", uri=True)
         rows = con.execute(
-            "SELECT id, title, custom_title, status FROM sessions WHERE deleted_at IS NULL"
+            "SELECT id, title, custom_title, status, last_activity_at "
+            "FROM sessions WHERE deleted_at IS NULL"
         ).fetchall()
         con.close()
-        for sid, title, custom, status in rows:
+        for sid, title, custom, status, last_active in rows:
             t = (custom or title or "").strip()
-            meta[sid] = {"title": t, "archived": (status == "archived")}
+            meta[sid] = {
+                "title": t,
+                "archived": (status == "archived"),
+                "status": (status or "").lower(),
+                "last_active": int(last_active or 0),
+            }
     except Exception:
         pass
     return meta
@@ -187,6 +195,8 @@ def parse_workbuddy_file(path: Path, db_meta: dict[str, dict] | None = None) -> 
         archived=archived,
         created_at=created,
         updated_at=updated,
+        native_status=entry.get("status", ""),
+        last_active=entry.get("last_active", 0),
     )
 
 
@@ -357,6 +367,9 @@ def parse_dsh_file(path: Path, archived_ids: set[str] | None = None) -> Session 
         archived=archived,
         created_at=created,
         updated_at=updated,
+        # DSH 没有会话级 status，归档状态即原生状态；进行中靠会话文件 mtime 判定
+        native_status="archived" if archived else "active",
+        last_active=updated,
     )
 
 

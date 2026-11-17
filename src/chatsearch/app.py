@@ -134,6 +134,12 @@ class APIHandler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/api/migrate":
             return self._handle_migrate(parsed)
+        if parsed.path == "/api/batch":
+            return self._handle_batch()
+        if parsed.path == "/api/archive":
+            qs = parse_qs(parsed.query)
+            key = (qs.get("key", [""])[0] or "").strip()
+            return self._handle_batch({"action": "archive", "keys": [key]})
         if parsed.path != "/api/unarchive":
             return self.send_error(404)
         qs = parse_qs(parsed.query)
@@ -160,6 +166,11 @@ class APIHandler(SimpleHTTPRequestHandler):
         source, _, sid = key.partition(":")
         if not sid:
             return self._send_json({"ok": False, "error": "key 格式不对"}, status=400)
+        # 进行中的会话正在被 App 写入，复制出去会得到半截内容，直接拒绝
+        if key in indexer.in_progress_set([key]):
+            return self._send_json(
+                {"ok": False, "error": "会话进行中，不可同步"}, status=400
+            )
         try:
             result = migrate.migrate(source, sid, target)
         except Exception as e:  # noqa: BLE001
@@ -173,6 +184,123 @@ class APIHandler(SimpleHTTPRequestHandler):
             pass
         watcher.note_synced()
         return self._send_json(result)
+
+    # ---------- 批量操作 ----------
+
+    def _read_json_body(self) -> dict | None:
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return None
+        if length <= 0:
+            return None
+        try:
+            raw = self.rfile.read(length)
+            data = json.loads(raw.decode("utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _handle_batch(self, body: dict | None = None) -> None:
+        """批量操作：{"action": "archive|unarchive|migrate", "keys": [...]}。
+
+        - 归档：进行中的会话跳过（正在被 App 写入，避免写坏）；
+        - 取消归档：不限；
+        - 同步：进行中跳过，且按每条会话的来源自动选另一端的 App。
+        """
+        data = body if body is not None else self._read_json_body()
+        if not data:
+            return self._send_json({"ok": False, "error": "请求体不是合法 JSON"}, status=400)
+        action = str(data.get("action") or "").strip()
+        raw_keys = data.get("keys") or []
+        if not isinstance(raw_keys, list):
+            return self._send_json({"ok": False, "error": "keys 必须是数组"}, status=400)
+        keys = [str(k).strip() for k in raw_keys if str(k).strip()]
+        keys = list(dict.fromkeys(keys))
+        if not keys:
+            return self._send_json({"ok": False, "error": "没有选中会话"}, status=400)
+
+        try:
+            if action in ("archive", "unarchive"):
+                result = indexer.set_archived(keys, archived=(action == "archive"))
+            elif action == "migrate":
+                result = self._batch_migrate(keys)
+            else:
+                return self._send_json(
+                    {"ok": False, "error": f"未知操作：{action}"}, status=400
+                )
+        except Exception as e:  # noqa: BLE001
+            return self._send_json(
+                {"ok": False, "error": f"{type(e).__name__}: {e}"}, status=500
+            )
+
+        watcher.note_synced()
+        # 批量操作可能"部分成功"：统一 200，由 ok/message 表达结果，前端才能展示明细
+        return self._send_json(result)
+
+    def _batch_migrate(self, keys: list[str]) -> dict:
+        """批量跨 App 同步：每条按来源发到另一端，最后统一重载 / 同步一次。"""
+        rows = indexer.session_rows(keys)
+        busy = indexer.in_progress_set(keys)
+        changed: list[dict] = []
+        skipped: list[dict] = []
+        failed: list[dict] = []
+        touched_wb = False
+        for key in keys:
+            row = rows.get(key)
+            if row is None:
+                skipped.append({"key": key, "reason": "会话不存在"})
+                continue
+            if key in busy:
+                skipped.append({"key": key, "reason": "会话进行中，不可同步"})
+                continue
+            source = row["source"]
+            target = "dsh" if source == "workbuddy" else "workbuddy"
+            try:
+                r = migrate.migrate(source, row["sid"], target, reload_ui=False)
+            except Exception as e:  # noqa: BLE001
+                failed.append({"key": key, "error": f"{type(e).__name__}: {e}"})
+                continue
+            if r.get("ok"):
+                changed.append({
+                    "key": key, "target": target,
+                    "target_sid": r.get("target_sid"), "messages": r.get("messages"),
+                })
+                touched_wb = touched_wb or target == "workbuddy"
+            else:
+                failed.append({"key": key, "error": r.get("error") or "同步失败"})
+
+        ui_refresh: dict = {}
+        if changed:
+            # 只有目标端是 WorkBuddy 时才需要重载它的界面（DSH 要重启才认新会话）
+            if touched_wb:
+                try:
+                    from .cdp import reload_workbuddy
+                    ui_refresh = reload_workbuddy()
+                except Exception as e:  # noqa: BLE001
+                    ui_refresh = {"ok": False, "error": str(e)}
+            try:
+                indexer.sync_index()
+            except Exception:  # noqa: BLE001
+                pass
+
+        parts = [f"已同步 {len(changed)} 条会话"]
+        if skipped:
+            parts.append(f"跳过 {len(skipped)} 条（{skipped[0].get('reason')}）")
+        if failed:
+            parts.append(f"失败 {len(failed)} 条（{failed[0].get('error')}）")
+        if changed:
+            parts.append("目标是 DSH 的需要重启它才能看到新会话")
+        return {
+            "ok": not failed,
+            "action": "migrate",
+            "changed": changed,
+            "skipped": skipped,
+            "failed": failed,
+            "ui_refresh": ui_refresh,
+            "error": None,
+            "message": "，".join(parts) + "。",
+        }
 
 
 # 持有 Mutex 句柄的模块级引用，防止被 GC 释放；托盘重启服务时复用

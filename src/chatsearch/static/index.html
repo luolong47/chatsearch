@@ -58,6 +58,9 @@
              placeholder="工作目录（全部）" autocomplete="off" spellcheck="false">
       <datalist id="cwd-options"></datalist>
       <button id="cwd-clear" class="cwd-clear" title="清除工作目录筛选">×</button>
+      <span class="filter-sep"></span>
+      <button id="select-toggle" class="chip chip-select"
+              title="批量操作：勾选多条会话，一起归档 / 取消归档 / 同步到另一端">☑ 批量</button>
       <span class="hint" id="result-hint"></span>
     </div>
   </section>
@@ -104,6 +107,20 @@
     <div id="drawer-body" class="drawer-body"></div>
   </div>
 </aside>
+
+<!-- 批量操作栏：进入批量模式后固定在底部 -->
+<div id="batch-bar" class="batch-bar hidden">
+  <span class="batch-count" id="batch-count">已选 0 条</span>
+  <span class="batch-sep"></span>
+  <button class="batch-btn" data-batch="select-all">全选</button>
+  <button class="batch-btn" data-batch="clear">清空</button>
+  <span class="batch-sep"></span>
+  <button class="batch-btn primary" data-batch="archive" title="把选中的会话在原生 App 里归档">归档</button>
+  <button class="batch-btn" data-batch="unarchive" title="把选中的会话在原生 App 里恢复为未归档">取消归档</button>
+  <button class="batch-btn" data-batch="migrate" title="把选中的会话复制到另一个 App（WorkBuddy ⇄ DSH），只搬文本对话">同步到另一端</button>
+  <span class="batch-sep"></span>
+  <button class="batch-btn ghost" data-batch="exit">退出批量</button>
+</div>
 
 <script src="/marked.min.js"></script>
 <script src="/highlight.min.js"></script>

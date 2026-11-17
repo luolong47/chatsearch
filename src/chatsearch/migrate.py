@@ -385,8 +385,12 @@ def export_to_workbuddy(sess: Session, reload_ui: bool = True) -> dict:
 # 对外入口
 # ---------------------------------------------------------------------------
 
-def migrate(source: str, sid: str, target: str) -> dict:
-    """把 source 侧的一条会话同步到 target 侧。返回结构化结果。"""
+def migrate(source: str, sid: str, target: str, reload_ui: bool = True) -> dict:
+    """把 source 侧的一条会话同步到 target 侧。返回结构化结果。
+
+    reload_ui=False 用于批量迁移：每条都重载一次 WorkBuddy 界面代价太大，
+    由调用方在所有会话写完后统一重载一次。
+    """
     if source not in (SOURCE_WORKBUDDY, SOURCE_DSH):
         return {"ok": False, "error": f"未知来源：{source}"}
     if target not in (SOURCE_WORKBUDDY, SOURCE_DSH):
@@ -402,4 +406,4 @@ def migrate(source: str, sid: str, target: str) -> dict:
 
     if target == SOURCE_DSH:
         return export_to_dsh(sess)
-    return export_to_workbuddy(sess)
+    return export_to_workbuddy(sess, reload_ui=reload_ui)

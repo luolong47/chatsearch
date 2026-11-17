@@ -85,7 +85,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at  INTEGER,
     updated_at  INTEGER,
     msg_count   INTEGER NOT NULL DEFAULT 0,
-    dedup_hash  TEXT
+    dedup_hash  TEXT,
+    native_status TEXT,
+    last_active INTEGER
 );
 CREATE TABLE IF NOT EXISTS messages (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -134,6 +136,11 @@ def _prepare(con: sqlite3.Connection) -> None:
         con.execute("ALTER TABLE sessions ADD COLUMN dedup_hash TEXT")
     if cols and "archived" not in cols:
         con.execute("ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
+    # 原生状态列：用于判定「会话进行中」（不可归档 / 不可同步）
+    if cols and "native_status" not in cols:
+        con.execute("ALTER TABLE sessions ADD COLUMN native_status TEXT")
+    if cols and "last_active" not in cols:
+        con.execute("ALTER TABLE sessions ADD COLUMN last_active INTEGER")
 
 
 def _get_meta(con: sqlite3.Connection, key: str) -> str | None:
@@ -199,7 +206,8 @@ def _refresh_archived(con: sqlite3.Connection) -> int:
     dsh_archived = _load_dsh_archived()
     changed = 0
     rows = con.execute(
-        "SELECT key,sid,source,archived FROM sessions WHERE source IN ('workbuddy','dsh')"
+        "SELECT key,sid,source,archived,native_status,last_active FROM sessions "
+        "WHERE source IN ('workbuddy','dsh')"
     ).fetchall()
     for row in rows:
         if row["source"] == "workbuddy":
@@ -207,12 +215,58 @@ def _refresh_archived(con: sqlite3.Connection) -> int:
             if entry is None:
                 continue  # db 里无记录（已删除/未知）保持原状
             want = 1 if entry.get("archived") else 0
+            status = entry.get("status") or ""
+            last = int(entry.get("last_active") or 0)
         else:
             want = 1 if _normalize_dsh_sid(row["sid"]) in dsh_archived else 0
-        if row["archived"] != want:
-            con.execute("UPDATE sessions SET archived=? WHERE key=?", (want, row["key"]))
+            status = "archived" if want else "active"
+            last = row["last_active"] or 0
+        if (row["archived"] != want
+                or (row["native_status"] or "") != status
+                or (row["last_active"] or 0) != last):
+            con.execute(
+                "UPDATE sessions SET archived=?,native_status=?,last_active=? WHERE key=?",
+                (want, status, last, row["key"]),
+            )
             changed += 1
     return changed
+
+
+# 判定「会话进行中」的时间窗：会话文件在这么多秒内被写过 = App 正在往里追加。
+# 取 5 分钟：足够覆盖"正在一问一答"，又不会把刚操作过的会话长时间锁住。
+IN_PROGRESS_WINDOW_MS = 5 * 60 * 1000
+
+
+def in_progress_keys(con: sqlite3.Connection, now_ms: int | None = None) -> set[str]:
+    """返回「正在进行中」的会话 key 集合。
+
+    规则（两源统一）：
+    - 会话文件在 IN_PROGRESS_WINDOW_MS 内被写过 → App 正在往里追加事件（含生成中）；
+    - 或 WorkBuddy 原生 status 为 working/running（正在生成，可能还没落盘）。
+
+    不用 last_activity_at 判定：WorkBuddy 的「取消归档」会把该字段刷成当前时间
+    （为了让会话回到侧边栏「最近」顶部），据此判断会把刚恢复的会话误锁 5 分钟。
+    文件 mtime 才是"App 正在写"的真实信号。
+    进行中的会话不允许归档 / 跨 App 同步，避免写坏正在被 App 写入的会话。
+    """
+    now = now_ms if now_ms is not None else int(time.time() * 1000)
+    out: set[str] = set()
+    mtimes = {
+        r["session_key"]: r["mtime_ns"]
+        for r in con.execute(
+            "SELECT session_key, MAX(mtime_ns) AS mtime_ns FROM files "
+            "WHERE session_key IS NOT NULL GROUP BY session_key"
+        )
+    }
+    for row in con.execute("SELECT key,source,native_status FROM sessions"):
+        status = (row["native_status"] or "").lower()
+        if row["source"] == "workbuddy" and status in ("working", "running", "in_progress"):
+            out.add(row["key"])
+            continue
+        mt = mtimes.get(row["key"])
+        if mt and now - mt / 1_000_000 < IN_PROGRESS_WINDOW_MS:
+            out.add(row["key"])
+    return out
 
 
 def _session_hash(s: Session) -> str:
@@ -242,13 +296,16 @@ def _delete_session_from_index(con: sqlite3.Connection, key: str) -> None:
 def _insert_session_into_index(con: sqlite3.Connection, s: Session) -> None:
     """插入一个会话及其消息，并增量加入 FTS。"""
     con.execute(
-        """INSERT INTO sessions(key,source,sid,title,cwd,archived,created_at,updated_at,msg_count,dedup_hash)
-           VALUES(?,?,?,?,?,?,?,?,?,?)""",
+        """INSERT INTO sessions(key,source,sid,title,cwd,archived,created_at,updated_at,
+                                msg_count,dedup_hash,native_status,last_active)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             s.key, s.source, s.sid, s.title, s.cwd, int(s.archived),
             s.created_at, s.updated_at,
             sum(1 for m in s.messages if m.is_indexable()),
             _session_hash(s),
+            s.native_status or "",
+            s.last_active or 0,
         ),
     )
     for m in s.sorted_messages():
@@ -583,6 +640,7 @@ def search(
     con = _connect()
     try:
         _prepare(con)
+        busy = in_progress_keys(con)
         long_terms = [t for t in terms if len(t) >= 3]
         short_terms = [t for t in terms if len(t) < 3]
         rows: dict[int, dict] = {}
@@ -628,6 +686,7 @@ def search(
                 "title": meta["title"],
                 "cwd": _visible_cwd(meta["cwd"]),
                 "archived": bool(meta["archived"]),
+                "in_progress": meta["key"] in busy,
                 "updated_at": meta["updated_at"] or 0,
                 "msg_count": meta["msg_count"],
                 "match_count": 0,
@@ -713,6 +772,7 @@ def get_session(session_key: str) -> dict | None:
         meta = con.execute("SELECT * FROM sessions WHERE key=?", (session_key,)).fetchone()
         if not meta:
             return None
+        busy = session_key in in_progress_keys(con)
         msgs = con.execute(
             "SELECT role,text,ts,seq FROM messages WHERE session_key=? ORDER BY ts,seq",
             (session_key,),
@@ -724,6 +784,8 @@ def get_session(session_key: str) -> dict | None:
             "title": meta["title"],
             "cwd": meta["cwd"] or "",
             "archived": bool(meta["archived"]),
+            "in_progress": busy,
+            "native_status": meta["native_status"] or "",
             "created_at": meta["created_at"] or 0,
             "updated_at": meta["updated_at"] or 0,
             "messages": [
@@ -803,10 +865,14 @@ def list_sessions(
         sql += " ORDER BY updated_at DESC LIMIT ?"
         params.append(limit)
         rows = con.execute(sql, params).fetchall()
+        busy = in_progress_keys(con)
         out = []
         for r in rows:
             d = dict(r)
             d["cwd"] = _visible_cwd(d["cwd"])
+            d["archived"] = bool(d["archived"])
+            d["in_progress"] = d["key"] in busy
+            d.pop("native_status", None)
             out.append(d)
         return {"sessions": out}
     finally:
@@ -1095,3 +1161,300 @@ def unarchive_session(key: str) -> dict:
     except Exception as e:  # 写原生存储成功但索引刷新失败时，如实告知
         result["sync_error"] = str(e)
     return result
+
+
+# ---------------------------------------------------------------------------
+# 批量归档 / 取消归档
+# ---------------------------------------------------------------------------
+# 单条操作走上面的 *_session()，每次都开一次备份 + 一次界面重载；
+# 批量时按来源合并：WorkBuddy 一次备份 + 一个事务，DSH 一次原子写，
+# 全部完成后只重载一次界面、只增量同步一次索引。
+
+def _archive_workbuddy_many(
+    sids: list[str],
+    db_path: Path = WORKBUDDY_DB,
+    backup_dir: Path = _BACKUP_DIR,
+    archived: bool = True,
+) -> dict:
+    """批量改 WorkBuddy 会话状态（archived=True 归档，False → active）。"""
+    uniq = sorted({s for s in (sids or []) if s})
+    if not uniq:
+        return {"ok": True, "changed": [], "skipped": [], "backup": None}
+    con = sqlite3.connect(f"file:{db_path}", uri=True, timeout=10)
+    backup: Path | None = None
+    try:
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA busy_timeout=8000")
+        marks = ",".join("?" * len(uniq))
+        rows = con.execute(
+            f"SELECT id, status, deleted_at FROM sessions WHERE id IN ({marks})", uniq
+        ).fetchall()
+        found = {r["id"]: r for r in rows}
+        changed: list[str] = []
+        skipped: list[dict] = []
+        targets: list[str] = []
+        for sid in uniq:
+            row = found.get(sid)
+            if row is None:
+                skipped.append({"sid": sid, "reason": "WorkBuddy 数据库中找不到该会话"})
+                continue
+            if row["deleted_at"] is not None:
+                skipped.append({"sid": sid, "reason": "会话已在 WorkBuddy 中被删除"})
+                continue
+            status = (row["status"] or "").lower()
+            if archived and status == "archived":
+                skipped.append({"sid": sid, "reason": "已是归档状态"})
+                continue
+            if not archived and status != "archived":
+                skipped.append({"sid": sid, "reason": "已是未归档状态"})
+                continue
+            targets.append(sid)
+
+        if targets:
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            backup = backup_dir / f"workbuddy-{_backup_stamp()}.db"
+            _backup_sqlite(db_path, backup)
+            now_ms = int(time.time() * 1000)
+            tmarks = ",".join("?" * len(targets))
+            if archived:
+                cur = con.execute(
+                    f"UPDATE sessions SET status='archived', updated_at=? "
+                    f"WHERE id IN ({tmarks}) AND deleted_at IS NULL",
+                    [now_ms, *targets],
+                )
+            else:
+                # 与 WorkBuddy 自己的 setArchived(false) 一致：回到 active 并刷新
+                # last_activity_at，否则会话回到未归档但埋在几百条之后。
+                cur = con.execute(
+                    f"UPDATE sessions SET status='active', updated_at=?, last_activity_at=? "
+                    f"WHERE id IN ({tmarks}) AND status='archived' AND deleted_at IS NULL",
+                    [now_ms, now_ms, *targets],
+                )
+            con.commit()
+            if cur.rowcount != len(targets):
+                return {
+                    "ok": False,
+                    "error": f"写入条数不符（期望 {len(targets)}，实际 {cur.rowcount}），"
+                             "状态可能已被其它进程修改",
+                    "backup": str(backup) if backup else None,
+                }
+            changed = targets
+        return {"ok": True, "changed": changed, "skipped": skipped,
+                "backup": str(backup) if backup else None}
+    except Exception as e:  # noqa: BLE001
+        con.rollback()
+        return {"ok": False, "error": f"写入 WorkBuddy 失败：{e}",
+                "backup": str(backup) if backup else None}
+    finally:
+        con.close()
+
+
+def _set_archived_dsh_many(
+    sids: list[str],
+    workspace_path: Path = DSH_WORKSPACE_JSON,
+    backup_dir: Path = _BACKUP_DIR,
+    archived: bool = True,
+) -> dict:
+    """批量改 DSH 归档集合（一次读、一次原子写）。"""
+    norms = sorted({_normalize_dsh_sid((s or "").strip()) for s in (sids or []) if s})
+    norms = [n for n in norms if n]
+    if not norms:
+        return {"ok": True, "changed": [], "skipped": [], "backup": None}
+    if not workspace_path.exists():
+        return {"ok": False, "error": "找不到 DSH workspace.json"}
+    try:
+        data = json.loads(workspace_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        return {"ok": False, "error": f"读取 DSH workspace.json 失败：{e}"}
+    global_obj = data.get("global")
+    ids = global_obj.get("archivedSessionIds") if isinstance(global_obj, dict) else None
+    if not isinstance(ids, list):
+        return {"ok": False, "error": "DSH workspace.json 结构异常（archivedSessionIds 不是数组）"}
+
+    current = {_normalize_dsh_sid(str(x)) for x in ids}
+    changed: list[str] = []
+    skipped: list[dict] = []
+    for norm in norms:
+        if archived and norm in current:
+            skipped.append({"sid": norm, "reason": "已是归档状态"})
+        elif not archived and norm not in current:
+            skipped.append({"sid": norm, "reason": "已是未归档状态"})
+        else:
+            changed.append(norm)
+    if not changed:
+        return {"ok": True, "changed": [], "skipped": skipped, "backup": None}
+
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup = backup_dir / f"dsh-workspace-{_backup_stamp()}.json"
+    shutil.copy2(workspace_path, backup)
+
+    if archived:
+        # DSH 自己写的是带前缀的 "session-<uuid>"，保持同一写法
+        kept = [x for x in ids if _normalize_dsh_sid(str(x)) not in set(changed)]
+        global_obj["archivedSessionIds"] = kept + [f"session-{n}" for n in changed]
+    else:
+        drop = set(changed)
+        global_obj["archivedSessionIds"] = [
+            x for x in ids if _normalize_dsh_sid(str(x)) not in drop
+        ]
+
+    tmp = workspace_path.with_name(f"{workspace_path.name}.tmp-{os.getpid()}")
+    try:
+        tmp.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        os.replace(tmp, workspace_path)
+    except OSError as e:
+        return {"ok": False, "error": f"写入 DSH workspace.json 失败：{e}",
+                "backup": str(backup)}
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+    return {"ok": True, "changed": changed, "skipped": skipped, "backup": str(backup)}
+
+
+def session_rows(keys: list[str]) -> dict[str, sqlite3.Row]:
+    """按 key 批量取会话元数据（key/source/sid/title/archived）。"""
+    keys = [k for k in (keys or []) if k]
+    if not keys:
+        return {}
+    con = _connect()
+    try:
+        _prepare(con)
+        marks = ",".join("?" * len(keys))
+        rows = con.execute(
+            f"SELECT key,source,sid,title,archived FROM sessions WHERE key IN ({marks})",
+            list(keys),
+        ).fetchall()
+        return {r["key"]: r for r in rows}
+    finally:
+        con.close()
+
+
+def in_progress_set(keys: list[str] | None = None) -> set[str]:
+    """当前进行中的会话 key 集合（可选只取指定 key 的交集）。"""
+    con = _connect()
+    try:
+        _prepare(con)
+        busy = in_progress_keys(con)
+    finally:
+        con.close()
+    return busy & set(keys) if keys else busy
+
+
+def set_archived(keys: list[str], archived: bool = True) -> dict:
+    """批量归档 / 取消归档，返回逐条结果。
+
+    - 进行中的会话（正在被 App 写入）拒绝操作，记入 skipped；
+    - 按来源合并写入：WorkBuddy 一次备份 + 单事务，DSH 一次原子写；
+    - 完成后重载 WorkBuddy 界面、增量同步索引各一次。
+    """
+    keys = [k for k in dict.fromkeys(keys or []) if k]
+    if not keys:
+        return {"ok": False, "error": "没有选中会话"}
+    rows = session_rows(keys)
+
+    con = _connect()
+    try:
+        _prepare(con)
+        busy = in_progress_keys(con)
+    finally:
+        con.close()
+
+    actions = "归档" if archived else "取消归档"
+    changed: list[str] = []
+    skipped: list[dict] = []
+    backups: list[str] = []
+    errors: list[str] = []
+
+    wb_sids: list[str] = []
+    wb_keys: dict[str, str] = {}
+    dsh_sids: list[str] = []
+    dsh_keys: dict[str, str] = {}
+    for key in keys:
+        row = rows.get(key)
+        if row is None:
+            skipped.append({"key": key, "reason": "会话不存在"})
+            continue
+        if archived and key in busy:
+            skipped.append({"key": key, "reason": "会话进行中，不可归档"})
+            continue
+        sid = row["sid"] or ""
+        if row["source"] == "workbuddy":
+            real = sid.split("/")[-1]
+            wb_sids.append(real)
+            wb_keys[real] = key
+        elif row["source"] == "dsh":
+            dsh_sids.append(sid)
+            dsh_keys[_normalize_dsh_sid(sid)] = key
+        else:
+            skipped.append({"key": key, "reason": f"不支持的来源：{row['source']}"})
+
+    if wb_sids:
+        r = _archive_workbuddy_many(wb_sids, archived=archived)
+        if not r.get("ok"):
+            errors.append(r.get("error") or "WorkBuddy 写入失败")
+        else:
+            changed += [wb_keys[s] for s in r.get("changed", []) if s in wb_keys]
+            for s in r.get("skipped", []):
+                k = wb_keys.get(s.get("sid", ""))
+                if k:
+                    skipped.append({"key": k, "reason": s.get("reason") or "跳过"})
+            if r.get("backup"):
+                backups.append(r["backup"])
+    if dsh_sids:
+        r = _set_archived_dsh_many(dsh_sids, archived=archived)
+        if not r.get("ok"):
+            errors.append(r.get("error") or "DSH 写入失败")
+        else:
+            changed += [
+                dsh_keys[n] for n in r.get("changed", []) if n in dsh_keys
+            ]
+            for s in r.get("skipped", []):
+                k = dsh_keys.get(s.get("sid", ""))
+                if k:
+                    skipped.append({"key": k, "reason": s.get("reason") or "跳过"})
+            if r.get("backup"):
+                backups.append(r["backup"])
+
+    ui_refresh: dict = {}
+    if changed:
+        wb_touched = any(rows[k]["source"] == "workbuddy" for k in changed if k in rows)
+        if wb_touched:
+            try:
+                ui_refresh = reload_workbuddy()
+            except Exception as e:  # noqa: BLE001
+                ui_refresh = {"ok": False, "error": str(e)}
+        try:
+            sync_index()
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"索引刷新失败：{e}")
+
+    dsh_touched = any(rows[k]["source"] == "dsh" for k in changed if k in rows)
+    return {
+        "ok": not errors,
+        "action": "archive" if archived else "unarchive",
+        "changed": changed,
+        "skipped": skipped,
+        "backups": backups,
+        "ui_refresh": ui_refresh,
+        "error": "；".join(errors) if errors else None,
+        "message": _archive_message(actions, changed, skipped, dsh_touched, errors),
+    }
+
+
+def _archive_message(
+    action: str, changed: list[str], skipped: list[dict],
+    dsh_touched: bool, errors: list[str],
+) -> str:
+    parts = [f"已{action} {len(changed)} 条会话"]
+    if skipped:
+        parts.append(f"跳过 {len(skipped)} 条（{skipped[0].get('reason')}）")
+    if dsh_touched:
+        parts.append("DSH 侧需重启应用才会显示最新归档状态")
+    if errors:
+        parts.append("；".join(errors))
+    return "，".join(parts) + "。"

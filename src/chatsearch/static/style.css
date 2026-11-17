@@ -333,6 +333,16 @@ mark {
 }
 .migrate-btn:hover { background: var(--chip-active-bg); }
 .migrate-btn:disabled { opacity: .55; cursor: wait; }
+/* 归档按钮：描边式，与「取消归档」区分（后者是实心强调色） */
+.archive-btn {
+  margin-left: 8px; padding: 2px 9px; font-size: 11px; font-family: inherit;
+  background: transparent; color: var(--text-dim);
+  border: 1px solid var(--border); border-radius: 6px; cursor: pointer;
+  vertical-align: middle; transition: .15s;
+}
+.archive-btn:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
+.archive-btn:disabled { opacity: .45; cursor: not-allowed; }
+.drawer-stat .busy-badge { vertical-align: middle; margin-left: 6px; }
 /* 工作目录：单独一行，可点复制，附文件夹打开按钮 */
 .cwd-line {
   display: flex; align-items: center; gap: 6px;
@@ -366,6 +376,8 @@ mark {
   opacity: 0; pointer-events: none; transition: opacity .18s, transform .18s;
 }
 .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+/* 批量操作栏固定在底部，提示气泡上移，避免两者叠在一起 */
+body.select-mode .toast { bottom: 88px; }
 .close-btn {
   position: absolute; top: 16px; right: 18px;
   background: transparent; border: 0; color: var(--text-dim); font-size: 26px; line-height: 1;
@@ -454,3 +466,59 @@ mark {
 .loading { text-align: center; color: var(--text-dim); padding: 40px; }
 .no-result { text-align: center; color: var(--text-dim); padding: 60px 20px; }
 .no-result .big { font-size: 40px; margin-bottom: 12px; }
+
+/* ---------- 批量选择 ---------- */
+.chip-select.active { background: var(--chip-active-bg); color: var(--chip-active-fg); border-color: var(--accent); }
+/* 每条会话前的选择框：批量模式下才渲染 */
+.rc-check {
+  flex: 0 0 auto; width: 18px; height: 18px; margin-right: 2px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 1.5px solid var(--border); border-radius: 5px;
+  background: var(--bg); color: transparent;
+  font-size: 12px; line-height: 1; font-weight: 700;
+  transition: .12s;
+}
+.result-card:hover .rc-check { border-color: var(--accent); }
+.result-card.selected { border-color: var(--accent); background: var(--bg-hover); }
+.result-card.selected .rc-check {
+  background: var(--accent); border-color: var(--accent); color: #fff;
+}
+.rc-check.disabled {
+  border-style: dashed; opacity: .5; cursor: not-allowed;
+  background: transparent; color: transparent;
+}
+/* 进行中的会话：整体降透明 + 虚线边框，明确"不可选" */
+.result-card.in-progress { opacity: .62; }
+.result-card.in-progress:hover { border-color: var(--border); background: var(--bg-elev); }
+.busy-badge {
+  background: rgba(242,193,78,.14); color: var(--mark-bg);
+  border: 1px solid rgba(242,193,78,.35); border-radius: 6px;
+  padding: 2px 8px; font-size: 11px; white-space: nowrap;
+}
+.busy-badge::before { content: "● "; font-size: 8px; vertical-align: middle; }
+
+/* 底部批量操作栏 */
+.batch-bar {
+  position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  max-width: calc(100vw - 40px);
+  padding: 9px 14px;
+  background: var(--bg-elev); border: 1px solid var(--border);
+  border-radius: 12px; box-shadow: var(--shadow); z-index: 90;
+  animation: fade .15s;
+}
+.batch-count { font-size: 12.5px; font-weight: 600; color: var(--text); white-space: nowrap; }
+.batch-sep { width: 1px; height: 18px; background: var(--border); margin: 0 2px; }
+.batch-btn {
+  background: transparent; color: var(--text-dim);
+  border: 1px solid var(--border); border-radius: 7px;
+  padding: 5px 11px; font-size: 12px; white-space: nowrap;
+  transition: .15s;
+}
+.batch-btn:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
+.batch-btn.primary {
+  background: var(--chip-active-bg); color: var(--chip-active-fg); border-color: var(--accent);
+}
+.batch-btn.ghost { border-color: transparent; }
+.batch-btn.ghost:hover:not(:disabled) { border-color: var(--border); }
+.batch-btn:disabled { opacity: .4; cursor: not-allowed; }

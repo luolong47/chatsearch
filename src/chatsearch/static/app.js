@@ -19,6 +19,9 @@
   let allCwds = [];        // /api/filters 的全部工作区（浏览态侧边栏用）
   let lastAllHits = null;  // 最近一次搜索的全量 hits（侧边栏聚合 + 点击工作区时前端过滤用）
   let navCleanup = null;   // 消息导航条的滚动监听清理函数
+  let selectMode = false;  // 批量选择模式
+  const selected = new Set();  // 已选会话 key
+  const busyKeys = new Set();  // 进行中的会话 key（不可归档 / 不可同步）
 
   const SOURCE_LABEL = { workbuddy: "WorkBuddy", dsh: "DeepSeek Harness" };
 
@@ -139,7 +142,7 @@
   async function api(url, options) {
     const r = await fetch(url, options);
     const data = await r.json();
-    if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+    if (!r.ok) throw new Error(data.error || data.message || `HTTP ${r.status}`);
     return data;
   }
 
@@ -262,9 +265,11 @@
       hintEl.textContent = parts.join(" · ");
       if (!shown.length) {
         resultList.innerHTML = `<div class="no-result"><div class="big">⌕</div>${currentCwd ? "该工作区没有命中" : "没有找到包含"}「${escapeHtml(query)}」${currentCwd ? "" : "的会话或消息"}</div>`;
+        pruneSelection();
         return;
       }
       resultList.innerHTML = shown.map(renderCard).join("");
+      pruneSelection();
     } catch (e) {
       resultList.innerHTML = `<div class="no-result">搜索失败：${escapeHtml(e.message)}</div>`;
     }
@@ -290,11 +295,132 @@
       hintEl.textContent = `${cwdLabel(currentCwd)} · ${data.sessions.length} 个会话`;
       if (!data.sessions.length) {
         resultList.innerHTML = '<div class="no-result"><div class="big">⌕</div>该工作区暂无会话</div>';
+        pruneSelection();
         return;
       }
       resultList.innerHTML = data.sessions.map(renderBrowseCard).join("");
+      pruneSelection();
     } catch (e) {
       resultList.innerHTML = `<div class="no-result">加载失败：${escapeHtml(e.message)}</div>`;
+    }
+  }
+
+  // ---------- 批量选择 ----------
+  // 进行中的会话（后端判定：App 正在写入）不允许归档 / 同步，卡片上禁用勾选。
+  function cardClass(key, inProgress) {
+    return "result-card"
+      + (selected.has(key) ? " selected" : "")
+      + (inProgress ? " in-progress" : "");
+  }
+
+  function checkHtml(key, inProgress) {
+    if (!selectMode) return "";
+    const on = selected.has(key);
+    const cls = "rc-check" + (inProgress ? " disabled" : "") + (on ? " on" : "");
+    const tip = inProgress ? "会话进行中，不能归档或同步" : (on ? "取消选择" : "选择该会话");
+    return `<span class="${cls}" data-check="${escapeHtml(key)}" title="${tip}">${on ? "✓" : ""}</span>`;
+  }
+
+  function busyBadge(inProgress) {
+    return inProgress
+      ? '<span class="busy-badge" title="会话仍在进行中：不可归档、不可同步">进行中</span>'
+      : "";
+  }
+
+  function refreshList() {
+    if (q.value.trim()) doSearch();
+    else browse();
+  }
+
+  function updateBatchBar() {
+    if (!selectMode) return;
+    const countEl = $("batch-count");
+    if (countEl) countEl.textContent = `已选 ${selected.size} 条`;
+    const cards = Array.from(document.querySelectorAll("#result-list .result-card"));
+    const pickable = cards.filter((c) => !c.classList.contains("in-progress"));
+    const none = selected.size === 0;
+    document.querySelectorAll("#batch-bar [data-batch]").forEach((b) => {
+      const act = b.dataset.batch;
+      if (act === "archive" || act === "unarchive" || act === "migrate") b.disabled = none;
+    });
+    const selAll = document.querySelector('#batch-bar [data-batch="select-all"]');
+    if (selAll) {
+      selAll.disabled = pickable.length === 0;
+      selAll.textContent = (pickable.length && selected.size >= pickable.length) ? "取消全选" : "全选";
+    }
+  }
+
+  function setSelectMode(on) {
+    selectMode = on;
+    if (!on) selected.clear();
+    $("select-toggle").classList.toggle("active", on);
+    $("batch-bar").classList.toggle("hidden", !on);
+    document.body.classList.toggle("select-mode", on);
+    refreshList();
+    updateBatchBar();
+  }
+
+  // 只保留当前列表里还看得见的选中项，避免切换筛选后"已选 N 条"里混着不可见的 key
+  function pruneSelection() {
+    const visible = new Set(
+      Array.from(document.querySelectorAll("#result-list .result-card")).map((c) => c.dataset.key)
+    );
+    let changed = false;
+    for (const k of Array.from(selected)) {
+      if (!visible.has(k)) { selected.delete(k); changed = true; }
+    }
+    if (changed) updateBatchBar();
+  }
+
+  function toggleSelect(card) {
+    const key = card.dataset.key;
+    if (card.classList.contains("in-progress")) {
+      toast("会话进行中，不能归档或同步");
+      return;
+    }
+    if (selected.has(key)) selected.delete(key);
+    else selected.add(key);
+    const on = selected.has(key);
+    card.classList.toggle("selected", on);
+    const box = card.querySelector(".rc-check");
+    if (box) {
+      box.textContent = on ? "✓" : "";
+      box.classList.toggle("on", on);
+      box.title = on ? "取消选择" : "选择该会话";
+    }
+    updateBatchBar();
+  }
+
+  async function runBatch(action, btn) {
+    if (!selected.size) return;
+    const keys = Array.from(selected);
+    const n = keys.length;
+    const tips = {
+      archive: `归档 ${n} 条会话？\n\n会写入 WorkBuddy 数据库或 DSH 配置（写前自动备份）。\n进行中的会话会被自动跳过。`,
+      unarchive: `取消归档 ${n} 条会话？\n\n会写回原生 App（写前自动备份）。\nDSH 侧需要重启应用才能看到变化。`,
+      migrate: `把 ${n} 条会话同步到另一端？\n\nWorkBuddy → DSH，DSH → WorkBuddy。只搬文本对话（提问 + 回复），\n不含工具调用、推理和附件；原会话保持不变，目标端生成新会话。\n进行中的会话会被自动跳过。`,
+    };
+    if (!confirm(tips[action] || "确定执行？")) return;
+
+    const raw = btn ? btn.textContent : "";
+    if (btn) { btn.textContent = "处理中…"; btn.disabled = true; }
+    document.querySelectorAll("#batch-bar [data-batch]").forEach((b) => { b.disabled = true; });
+    try {
+      const r = await api("/api/batch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action, keys }),
+      });
+      toast(r.message || "已完成", 7000);
+      if (r.changed && r.changed.length) selected.clear();
+      await loadStatus();
+      await loadFilters();
+      refreshList();
+    } catch (err) {
+      toast(`操作失败：${err.message}`, 7000);
+    } finally {
+      if (btn) btn.textContent = raw;
+      updateBatchBar();
     }
   }
 
@@ -303,9 +429,10 @@
     const badge = `<span class="src-badge badge-${s.source}">${SOURCE_LABEL[s.source] || s.source}</span>`;
     const arcBadge = s.archived ? '<span class="arc-badge">已归档</span>' : "";
     return `
-      <div class="result-card" data-key="${escapeHtml(s.key)}">
+      <div class="${cardClass(s.key, s.in_progress)}" data-key="${escapeHtml(s.key)}">
         <div class="rc-head">
-          ${badge}${arcBadge}
+          ${checkHtml(s.key, s.in_progress)}
+          ${badge}${arcBadge}${busyBadge(s.in_progress)}
           <span class="rc-title" title="${escapeHtml(s.title)}">${escapeHtml(s.title)}</span>
         </div>
         <div class="rc-foot">
@@ -325,10 +452,11 @@
         <span class="txt md-inline markdown-body">${renderMd(s.text, lastQuery)}</span>
       </div>`).join("");
     return `
-      <div class="result-card" data-key="${escapeHtml(h.session_key)}">
+      <div class="${cardClass(h.session_key, h.in_progress)}" data-key="${escapeHtml(h.session_key)}">
         <div class="rc-head">
+          ${checkHtml(h.session_key, h.in_progress)}
           ${badge}
-          ${arcBadge}
+          ${arcBadge}${busyBadge(h.in_progress)}
           <span class="rc-title" title="${escapeHtml(h.title)}">${escapeHtml(h.title)}</span>
           <span class="rc-count">${h.match_count} 处命中</span>
         </div>
@@ -363,16 +491,23 @@
       src.className = `src-badge badge-${s.source}`;
 
       // 第一行：统计；第二行：工作目录（单独一行，可复制 + 打开）
+      // 进行中的会话不能归档 / 同步（App 正在往会话里写数据）
+      const busy = !!s.in_progress;
+      const busyTag = busy
+        ? ' <span class="busy-badge" title="会话仍在进行中：不可归档、不可同步">进行中</span>'
+        : "";
       const unarchiveBtn = s.archived
         ? ` <button class="unarchive-btn" data-act="unarchive" title="从原生应用恢复为未归档（写前自动备份）">取消归档</button>`
-        : "";
+        : ` <button class="archive-btn" data-act="archive"${busy ? " disabled" : ""}`
+          + ` title="${busy ? "会话进行中，不可归档" : "在原生应用里归档（写前自动备份）"}">归档</button>`;
       // 跨 App 同步：把这条会话复制到另一端的原生存储
       const otherLabel = s.source === "workbuddy" ? "DSH" : "WorkBuddy";
       const migrateTarget = s.source === "workbuddy" ? "dsh" : "workbuddy";
       const migrateBtn = ` <button class="migrate-btn" data-act="migrate" data-target="${migrateTarget}"`
-        + ` title="把这条会话复制到 ${otherLabel}（只搬文本对话，写前自动备份）">同步到 ${otherLabel}</button>`;
+        + (busy ? " disabled" : "")
+        + ` title="${busy ? "会话进行中，不可同步" : `把这条会话复制到 ${otherLabel}（只搬文本对话，写前自动备份）`}">同步到 ${otherLabel}</button>`;
       const stat = `共 ${s.messages.length} 条消息 · ${fmtTime(s.created_at)} — ${fmtTime(s.updated_at)}` +
-        (s.archived ? ' <span class="arc-badge">已归档</span>' : "") + unarchiveBtn + migrateBtn;
+        (s.archived ? ' <span class="arc-badge">已归档</span>' : "") + busyTag + unarchiveBtn + migrateBtn;
       const cwdLine = s.cwd
         ? `<div class="cwd-line" id="cwd-line" title="点击复制完整路径">
              <span class="cwd-label">工作目录</span>
@@ -520,6 +655,10 @@
       await doUnarchive(btn);
       return;
     }
+    if (act === "archive") {
+      await doArchive(btn);
+      return;
+    }
     if (act === "migrate") {
       await doMigrate(btn);
       return;
@@ -584,6 +723,37 @@
     } catch (err) {
       toast(`取消归档失败：${err.message}`, 5200);
       if (btn) { btn.disabled = false; btn.textContent = label; }
+    }
+  }
+
+  // 归档：把当前会话在原生 App 里置为归档（单条也走批量接口，写前自动备份）
+  async function doArchive(btn) {
+    const key = $("drawer-meta").dataset.key;
+    if (!key) return;
+    const ok = confirm(
+      "确定归档这条会话吗？\n\n" +
+      "会写入 WorkBuddy 数据库或 DSH 配置（写前自动备份）。\n" +
+      "DSH 侧需要重启应用才能看到变化。"
+    );
+    if (!ok) return;
+    const raw = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "处理中…";
+    try {
+      const r = await api("/api/batch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "archive", keys: [key] }),
+      });
+      toast(r.message || "已归档", 6000);
+      await loadStatus();
+      await loadFilters();
+      refreshList();
+      await openSession(key);
+    } catch (err) {
+      toast(`归档失败：${err.message}`, 6000);
+      btn.disabled = false;
+      btn.textContent = raw;
     }
   }
 
@@ -695,7 +865,43 @@
 
   resultList.addEventListener("click", (e) => {
     const card = e.target.closest(".result-card");
-    if (card) openSession(card.dataset.key);
+    if (!card) return;
+    if (selectMode) { toggleSelect(card); return; }
+    openSession(card.dataset.key);
+  });
+
+  // ---------- 批量模式 ----------
+  $("select-toggle").addEventListener("click", () => setSelectMode(!selectMode));
+
+  // 只更新卡片勾选态，不重新拉数据（切换全选时避免闪一下）
+  function syncCardChecks() {
+    document.querySelectorAll("#result-list .result-card").forEach((c) => {
+      const on = selected.has(c.dataset.key);
+      c.classList.toggle("selected", on);
+      const box = c.querySelector(".rc-check");
+      if (box) {
+        box.textContent = on ? "✓" : "";
+        box.classList.toggle("on", on);
+      }
+    });
+    updateBatchBar();
+  }
+
+  $("batch-bar").addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-batch]");
+    if (!btn) return;
+    const act = btn.dataset.batch;
+    if (act === "exit") { setSelectMode(false); return; }
+    if (act === "clear") { selected.clear(); syncCardChecks(); return; }
+    if (act === "select-all") {
+      const cards = Array.from(document.querySelectorAll("#result-list .result-card:not(.in-progress)"));
+      const allPicked = cards.length > 0 && cards.every((c) => selected.has(c.dataset.key));
+      if (allPicked) selected.clear();
+      else cards.forEach((c) => selected.add(c.dataset.key));
+      syncCardChecks();
+      return;
+    }
+    runBatch(act, btn);
   });
 
   $("drawer-close").addEventListener("click", closeDrawer);
