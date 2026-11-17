@@ -31,9 +31,16 @@ from .config import (
     WORKBUDDY_DB,
     WORKBUDDY_PROJECTS,
 )
+from .indexer import (
+    find_same_content,
+    get_migration,
+    record_migration,
+    session_hash,
+)
 from .models import Message, Session
 
 BACKUP_DIR = DATA_DIR / "backups"
+BACKUP_KEEP = 20               # 每类备份最多保留份数，防止批量同步把磁盘写满
 DSH_TITLE_PREFIX = ""          # 标题保持原样，便于在目标 App 里一眼认出
 MARK_SUFFIX = ""               # 需要时可加「（同步自 …）」
 
@@ -58,10 +65,28 @@ def _new_uuid() -> str:
     return str(uuid.uuid4())
 
 
+def _prune_backups(tag: str, keep: int = BACKUP_KEEP) -> None:
+    """同类备份只保留最近 keep 份。批量同步每条都备份会把磁盘写满。"""
+    try:
+        files = sorted(
+            (p for p in BACKUP_DIR.glob(f"{tag}-*") if p.is_file()),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return
+    for p in files[keep:]:
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+
 def _backup_file(src: Path, tag: str) -> Path:
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     dst = BACKUP_DIR / f"{tag}-{_stamp()}{src.suffix}"
     shutil.copy2(src, dst)
+    _prune_backups(tag)
     return dst
 
 
@@ -76,6 +101,7 @@ def _backup_sqlite(src: Path, tag: str) -> Path:
     finally:
         dst_con.close()
         src_con.close()
+    _prune_backups(tag)
     return dst
 
 
@@ -210,7 +236,7 @@ def _dsh_events(sess: Session, sid: str) -> list[dict]:
     return out
 
 
-def export_to_dsh(sess: Session) -> dict:
+def export_to_dsh(sess: Session, backup: bool = True) -> dict:
     """把一条会话写成 DSH 原生会话，并登记到 workspace.json。"""
     if not DSH_WORKSPACE_JSON.is_file():
         return {"ok": False, "error": "找不到 DSH workspace.json，DSH 可能未安装或未初始化"}
@@ -226,7 +252,7 @@ def export_to_dsh(sess: Session) -> dict:
     target_dir = DSH_SESSIONS / f"--{_slug(cwd)}--" / sid
     payload = "\n".join(json.dumps(e, ensure_ascii=False) for e in _dsh_events(sess, sid)) + "\n"
 
-    backup = _backup_file(DSH_WORKSPACE_JSON, "workspace")
+    backup_path = _backup_file(DSH_WORKSPACE_JSON, "workspace") if backup else None
     try:
         target_dir.mkdir(parents=True, exist_ok=True)
         f = target_dir / "session.v4.jsonl.zstd"
@@ -235,6 +261,14 @@ def export_to_dsh(sess: Session) -> dict:
         session_ids = workspace.setdefault("sessionIds", [])
         if sid not in session_ids:
             session_ids.append(sid)
+        # 归档状态跟着会话走：源端已归档，目标端也归到「已归档」
+        arch = ws.setdefault("global", {}).setdefault("archivedSessionIds", [])
+        if sess.archived:
+            if sid not in arch:
+                arch.append(sid)
+        else:
+            while sid in arch:
+                arch.remove(sid)
         workspace["updatedAt"] = time.strftime("%Y-%m-%dT%H:%M:%S.") + f"{_now_ms() % 1000:03d}Z"
         DSH_WORKSPACE_JSON.write_text(
             json.dumps(ws, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -242,10 +276,11 @@ def export_to_dsh(sess: Session) -> dict:
     except OSError as e:
         # 回滚：删掉刚写进去的目录，避免 DSH 列表里出现打不开的空会话
         shutil.rmtree(target_dir, ignore_errors=True)
-        try:
-            shutil.copy2(backup, DSH_WORKSPACE_JSON)
-        except OSError:
-            pass
+        if backup_path:
+            try:
+                shutil.copy2(backup_path, DSH_WORKSPACE_JSON)
+            except OSError:
+                pass
         return {"ok": False, "error": f"写入失败：{e}"}
 
     return {
@@ -255,7 +290,8 @@ def export_to_dsh(sess: Session) -> dict:
         "path": str(target_dir),
         "turns": sum(1 for m in sess.messages if m.role == "user"),
         "messages": len(sess.messages),
-        "backup": str(backup),
+        "archived": bool(sess.archived),
+        "backup": str(backup_path) if backup_path else "",
         "workspace": ws_id,
     }
 
@@ -311,7 +347,7 @@ def _wb_lines(sess: Session, sid: str, cwd: str) -> list[dict]:
     return lines
 
 
-def export_to_workbuddy(sess: Session, reload_ui: bool = True) -> dict:
+def export_to_workbuddy(sess: Session, reload_ui: bool = True, backup: bool = True) -> dict:
     """把一条会话写成 WorkBuddy 原生 jsonl，并在 workbuddy.db 里登记。"""
     if not WORKBUDDY_DB.is_file():
         return {"ok": False, "error": "找不到 WorkBuddy 数据库，WorkBuddy 可能未安装"}
@@ -322,8 +358,10 @@ def export_to_workbuddy(sess: Session, reload_ui: bool = True) -> dict:
     jsonl = proj / f"{sid}.jsonl"
     now = _now_ms()
     created = sess.created_at or now
+    # 归档状态跟着会话走：源端已归档，目标端也归到「已归档」
+    status = "archived" if sess.archived else "completed"
 
-    backup = _backup_sqlite(WORKBUDDY_DB, "workbuddy")
+    backup_path = _backup_sqlite(WORKBUDDY_DB, "workbuddy") if backup else None
     created_file = False
     con = sqlite3.connect(f"file:{WORKBUDDY_DB}", uri=True, timeout=10)
     try:
@@ -344,7 +382,7 @@ def export_to_workbuddy(sess: Session, reload_ui: bool = True) -> dict:
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 sid, cwd, user_id, (sess.title or "迁移会话") + MARK_SUFFIX, None,
-                "completed", created, now, now, 0, "craft", "craft",
+                status, created, now, now, 0, "craft", "craft",
                 "local", "fullAccess", 0,
             ),
         )
@@ -376,20 +414,144 @@ def export_to_workbuddy(sess: Session, reload_ui: bool = True) -> dict:
         "path": str(jsonl),
         "messages": len(sess.messages),
         "cwd": cwd,
-        "backup": str(backup),
+        "archived": bool(sess.archived),
+        "backup": str(backup_path) if backup_path else "",
         "ui_refresh": refresh,
     }
+
+
+# ---------------------------------------------------------------------------
+# 删除同步出去的副本（仅「强制覆盖」时使用）
+# ---------------------------------------------------------------------------
+
+def _strip_dsh_prefix(sid: str) -> str:
+    return sid[len("session-"):] if sid.startswith("session-") else sid
+
+
+def _wb_jsonl_paths(sid: str) -> list[Path]:
+    sid = (sid or "").strip()
+    if not sid:
+        return []
+    direct = WORKBUDDY_PROJECTS / f"{sid}.jsonl"
+    if direct.is_file():
+        return [direct]
+    stem = sid.split("/")[-1]
+    return [p for p in WORKBUDDY_PROJECTS.rglob(f"{stem}.jsonl") if p.is_file()]
+
+
+def _remove_wb_copy(sid: str) -> dict:
+    paths = _wb_jsonl_paths(sid)
+    if not paths:
+        return {"ok": False, "error": "目标端找不到该会话文件"}
+    backup = _backup_sqlite(WORKBUDDY_DB, "workbuddy")
+    removed: list[str] = []
+    for p in paths:
+        try:
+            p.unlink()
+            removed.append(str(p))
+        except OSError as e:
+            return {"ok": False, "error": f"删除失败：{e}", "removed": removed}
+    try:
+        con = sqlite3.connect(f"file:{WORKBUDDY_DB}", uri=True, timeout=10)
+        con.execute("PRAGMA busy_timeout=8000")
+        con.execute("DELETE FROM sessions WHERE id=?", (paths[0].stem,))
+        con.commit()
+        con.close()
+    except sqlite3.Error as e:
+        return {"ok": False, "error": f"清理数据库失败：{e}", "removed": removed}
+    return {"ok": True, "removed": removed, "backup": str(backup)}
+
+
+def _remove_dsh_copy(sid: str) -> dict:
+    short = _strip_dsh_prefix((sid or "").strip())
+    if not short:
+        return {"ok": False, "error": "sid 为空"}
+    if not DSH_WORKSPACE_JSON.is_file():
+        return {"ok": False, "error": "找不到 DSH workspace.json"}
+    full = f"session-{short}"
+    dirs = [d for d in DSH_SESSIONS.rglob(full) if d.is_dir()]
+    if not dirs:
+        return {"ok": False, "error": "目标端找不到该会话目录"}
+
+    backup = _backup_file(DSH_WORKSPACE_JSON, "workspace")
+    for d in dirs:
+        shutil.rmtree(d, ignore_errors=True)
+    try:
+        ws = json.loads(DSH_WORKSPACE_JSON.read_text(encoding="utf-8"))
+        for w in (ws.get("tables", {}).get("workspaces", {}) or {}).values():
+            ids = w.get("sessionIds") or []
+            while full in ids:
+                ids.remove(full)
+        arch = (ws.get("global") or {}).get("archivedSessionIds") or []
+        while full in arch:
+            arch.remove(full)
+        DSH_WORKSPACE_JSON.write_text(
+            json.dumps(ws, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except (OSError, json.JSONDecodeError) as e:
+        return {"ok": False, "error": f"清理 workspace.json 失败：{e}"}
+    return {"ok": True, "removed": [str(d) for d in dirs], "backup": str(backup)}
+
+
+def remove_target_copy(target: str, target_sid: str) -> dict:
+    """删除由本工具同步出去的副本（只认登记过的 sid，不动用户原生会话）。"""
+    if target == SOURCE_WORKBUDDY:
+        return _remove_wb_copy(target_sid)
+    if target == SOURCE_DSH:
+        return _remove_dsh_copy(target_sid)
+    return {"ok": False, "error": f"未知目标：{target}"}
+
+
+def backup_snapshot() -> dict:
+    """批量同步前统一备份一次（避免每条各备一份把磁盘写满）。"""
+    out: dict[str, str] = {}
+    try:
+        if DSH_WORKSPACE_JSON.is_file():
+            out["workspace"] = str(_backup_file(DSH_WORKSPACE_JSON, "workspace"))
+    except OSError as e:
+        out["workspace_error"] = str(e)
+    try:
+        if WORKBUDDY_DB.is_file():
+            out["workbuddy"] = str(_backup_sqlite(WORKBUDDY_DB, "workbuddy"))
+    except (OSError, sqlite3.Error) as e:
+        out["workbuddy_error"] = str(e)
+    return out
 
 
 # ---------------------------------------------------------------------------
 # 对外入口
 # ---------------------------------------------------------------------------
 
-def migrate(source: str, sid: str, target: str, reload_ui: bool = True) -> dict:
+def _label(source: str) -> str:
+    return "WorkBuddy" if source == SOURCE_WORKBUDDY else "DeepSeek Harness"
+
+
+def _target_index_sid(target: str, path: str) -> str:
+    """把写出的文件路径转成「索引里的 sid 形式」（WB 含项目 slug）。"""
+    p = Path(path)
+    if target == SOURCE_WORKBUDDY:
+        return parsers.workbuddy_sid(p)
+    return _strip_dsh_prefix(p.name)
+
+
+def migrate(
+    source: str,
+    sid: str,
+    target: str,
+    reload_ui: bool = True,
+    backup: bool = True,
+    force: bool = False,
+) -> dict:
     """把 source 侧的一条会话同步到 target 侧。返回结构化结果。
 
     reload_ui=False 用于批量迁移：每条都重载一次 WorkBuddy 界面代价太大，
     由调用方在所有会话写完后统一重载一次。
+    backup=False 用于批量迁移：由调用方先 backup_snapshot() 统一备份一次。
+    force=True 才有「覆盖」语义：先删掉登记过的旧副本再写新的。
+
+    幂等：同一源会话对同一目标端只保留一份副本。
+    - 内容指纹相同 → already=True，不写；
+    - 源端内容已变（源会话又有新对话）→ already=True + stale=True，提示需强制覆盖。
     """
     if source not in (SOURCE_WORKBUDDY, SOURCE_DSH):
         return {"ok": False, "error": f"未知来源：{source}"}
@@ -404,6 +566,58 @@ def migrate(source: str, sid: str, target: str, reload_ui: bool = True) -> dict:
     if not sess.messages:
         return {"ok": False, "error": "该会话没有可迁移的消息"}
 
+    h = session_hash(sess)
+
+    prev = get_migration(sess.key, target)
+    if prev and not force:
+        if prev["content_hash"] == h:
+            return {
+                "ok": False, "already": True, "reason": "same",
+                "target": target, "target_sid": prev["target_sid"],
+                "error": "目标端已有同内容副本",
+                "message": f"{_label(target)} 里已有这条会话，未重复写入。",
+            }
+        return {
+            "ok": False, "already": True, "reason": "stale",
+            "target": target, "target_sid": prev["target_sid"],
+            "error": "目标端副本内容不一致",
+            "message": (
+                f"{_label(target)} 里的副本与当前内容不一致（源端有新对话）。"
+                "需要覆盖时请用强制同步。"
+            ),
+        }
+
+    # 兜底：早期版本同步出去、没有登记记录的副本，按内容指纹认一次
+    if not prev and not force:
+        hit = find_same_content(target, h)
+        if hit:
+            try:
+                record_migration(sess.key, target, h, hit["sid"])
+            except Exception:  # noqa: BLE001
+                pass
+            return {
+                "ok": False, "already": True, "reason": "same",
+                "target": target, "target_sid": hit["sid"],
+                "error": "目标端已有同内容副本",
+                "message": f"{_label(target)} 里已有这条会话，未重复写入。",
+            }
+
+    if force and prev:
+        removed = remove_target_copy(target, prev["target_sid"])
+        if not removed.get("ok"):
+            return {
+                "ok": False,
+                "error": f"覆盖失败，旧副本没有删掉：{removed.get('error')}",
+            }
+
     if target == SOURCE_DSH:
-        return export_to_dsh(sess)
-    return export_to_workbuddy(sess, reload_ui=reload_ui)
+        r = export_to_dsh(sess, backup=backup)
+    else:
+        r = export_to_workbuddy(sess, reload_ui=reload_ui, backup=backup)
+
+    if r.get("ok"):
+        try:
+            record_migration(sess.key, target, h, _target_index_sid(target, r["path"]))
+        except Exception:  # noqa: BLE001 - 登记失败不影响已完成的写入
+            pass
+    return r

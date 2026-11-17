@@ -161,6 +161,7 @@ class APIHandler(SimpleHTTPRequestHandler):
         qs = parse_qs(parsed.query)
         key = (qs.get("key", [""])[0] or "").strip()
         target = (qs.get("target", [""])[0] or "").strip()
+        force = (qs.get("force", [""])[0] or "").lower() in ("1", "true", "yes")
         if not key or target not in ("workbuddy", "dsh"):
             return self._send_json({"ok": False, "error": "缺少 key 或 target 非法"}, status=400)
         source, _, sid = key.partition(":")
@@ -172,9 +173,12 @@ class APIHandler(SimpleHTTPRequestHandler):
                 {"ok": False, "error": "会话进行中，不可同步"}, status=400
             )
         try:
-            result = migrate.migrate(source, sid, target)
+            result = migrate.migrate(source, sid, target, force=force)
         except Exception as e:  # noqa: BLE001
             return self._send_json({"ok": False, "error": f"{type(e).__name__}: {e}"}, status=500)
+        # 「已存在同内容副本」不是错误：200 + already，前端只需提示不重复写入
+        if result.get("already"):
+            return self._send_json(result)
         if not result.get("ok"):
             return self._send_json(result, status=400)
         # 新会话已落到原生存储，立刻补一次增量同步，让它出现在检索里
@@ -239,13 +243,19 @@ class APIHandler(SimpleHTTPRequestHandler):
         return self._send_json(result)
 
     def _batch_migrate(self, keys: list[str]) -> dict:
-        """批量跨 App 同步：每条按来源发到另一端，最后统一重载 / 同步一次。"""
+        """批量跨 App 同步：每条按来源发到另一端，最后统一重载 / 同步一次。
+
+        幂等：已同步过且内容未变的会话记为 skipped，不会重复写入目标端。
+        备份：整批只备份一次（每条各备一份会把 data/backups 写满）。
+        """
         rows = indexer.session_rows(keys)
         busy = indexer.in_progress_set(keys)
         changed: list[dict] = []
         skipped: list[dict] = []
         failed: list[dict] = []
         touched_wb = False
+        backups: dict = {}
+        backed_up = False
         for key in keys:
             row = rows.get(key)
             if row is None:
@@ -257,7 +267,12 @@ class APIHandler(SimpleHTTPRequestHandler):
             source = row["source"]
             target = "dsh" if source == "workbuddy" else "workbuddy"
             try:
-                r = migrate.migrate(source, row["sid"], target, reload_ui=False)
+                if not backed_up:
+                    backups = migrate.backup_snapshot()
+                    backed_up = True
+                r = migrate.migrate(
+                    source, row["sid"], target, reload_ui=False, backup=False
+                )
             except Exception as e:  # noqa: BLE001
                 failed.append({"key": key, "error": f"{type(e).__name__}: {e}"})
                 continue
@@ -267,6 +282,12 @@ class APIHandler(SimpleHTTPRequestHandler):
                     "target_sid": r.get("target_sid"), "messages": r.get("messages"),
                 })
                 touched_wb = touched_wb or target == "workbuddy"
+            elif r.get("already"):
+                skipped.append({
+                    "key": key,
+                    "reason": "已同步过（内容相同）" if r.get("reason") == "same"
+                              else "目标端副本内容不一致",
+                })
             else:
                 failed.append({"key": key, "error": r.get("error") or "同步失败"})
 
@@ -286,7 +307,7 @@ class APIHandler(SimpleHTTPRequestHandler):
 
         parts = [f"已同步 {len(changed)} 条会话"]
         if skipped:
-            parts.append(f"跳过 {len(skipped)} 条（{skipped[0].get('reason')}）")
+            parts.append(f"跳过 {len(skipped)} 条，原因：{skipped[0].get('reason')}")
         if failed:
             parts.append(f"失败 {len(failed)} 条（{failed[0].get('error')}）")
         if changed:
@@ -297,6 +318,7 @@ class APIHandler(SimpleHTTPRequestHandler):
             "changed": changed,
             "skipped": skipped,
             "failed": failed,
+            "backups": backups,
             "ui_refresh": ui_refresh,
             "error": None,
             "message": "，".join(parts) + "。",

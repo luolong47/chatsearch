@@ -114,6 +114,18 @@ CREATE TABLE IF NOT EXISTS meta (
     k TEXT PRIMARY KEY,
     v TEXT NOT NULL
 );
+-- 跨 App 同步登记：记录「哪个源会话同步到哪一端、写出的 sid、当时的内容指纹」。
+-- 用途：1) 幂等，重复点同步不再生成新副本；2) 源内容变化时定位旧副本做替换。
+-- 这张表不参与索引重建（_build_full 只清 sessions/messages/files）。
+CREATE TABLE IF NOT EXISTS migrations (
+    source_key    TEXT NOT NULL,
+    target_source TEXT NOT NULL,
+    content_hash  TEXT NOT NULL,
+    target_sid    TEXT NOT NULL,
+    updated_at    INTEGER,
+    PRIMARY KEY (source_key, target_source)
+);
+CREATE INDEX IF NOT EXISTS idx_migrations_hash ON migrations(target_source, content_hash);
 """
 
 
@@ -121,8 +133,9 @@ CREATE TABLE IF NOT EXISTS meta (
 # 连接 / schema
 # ---------------------------------------------------------------------------
 
-def _connect(db_path: Path = INDEX_DB) -> sqlite3.Connection:
-    con = sqlite3.connect(str(db_path))
+def _connect(db_path: Path | None = None) -> sqlite3.Connection:
+    # 运行时读模块级 INDEX_DB（而非默认参数绑定），便于测试整体切到临时库
+    con = sqlite3.connect(str(db_path or INDEX_DB))
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA journal_mode=WAL")
     return con
@@ -269,8 +282,11 @@ def in_progress_keys(con: sqlite3.Connection, now_ms: int | None = None) -> set[
     return out
 
 
-def _session_hash(s: Session) -> str:
-    """按「角色+正文」序列计算内容指纹，用于跨文件去重。"""
+def session_hash(s: Session) -> str:
+    """按「角色+正文」序列计算内容指纹，用于跨文件去重与同步幂等判定。
+
+    同一段对话在两端 App 里解析出的 role/text 序列相同，所以指纹可直接跨源比对。
+    """
     d = hashlib.sha256()
     for m in s.sorted_messages():
         d.update(f"{m.role}\x00{m.text}\x01".encode("utf-8"))
@@ -303,7 +319,7 @@ def _insert_session_into_index(con: sqlite3.Connection, s: Session) -> None:
             s.key, s.source, s.sid, s.title, s.cwd, int(s.archived),
             s.created_at, s.updated_at,
             sum(1 for m in s.messages if m.is_indexable()),
-            _session_hash(s),
+            session_hash(s),
             s.native_status or "",
             s.last_active or 0,
         ),
@@ -408,7 +424,7 @@ def _sync_index_locked() -> dict:
                     (p, current[p][0], current[p][1]),
                 )
                 continue
-            fp = (s.source, _session_hash(s))
+            fp = (s.source, session_hash(s))
             if fp in existing_hashes:
                 # 内容与其他会话重复：跳过入库，但记录文件指纹，避免反复重解析
                 dup_key = con.execute(
@@ -460,7 +476,7 @@ def _build_full(con: sqlite3.Connection, current: dict[str, tuple[int, int]]) ->
     deduped: dict[tuple[str, str], Session] = {}
     dup_count = 0
     for s in sessions:
-        fp = (s.source, _session_hash(s))
+        fp = (s.source, session_hash(s))
         prev = deduped.get(fp)
         if prev is None or s.updated_at > prev.updated_at:
             if prev is not None:
@@ -485,7 +501,7 @@ def _build_full(con: sqlite3.Connection, current: dict[str, tuple[int, int]]) ->
         s = parse_file(Path(p), db_meta, dsh_archived)
         linked = None
         if s is not None:
-            fp = (s.source, _session_hash(s))
+            fp = (s.source, session_hash(s))
             kept = deduped.get(fp)
             # 仅当被保留的会话与该文件 sid 一致时才直接关联；否则关联到同内容会话
             if kept is not None:
@@ -1458,3 +1474,68 @@ def _archive_message(
     if errors:
         parts.append("；".join(errors))
     return "，".join(parts) + "。"
+
+
+# ---------------------------------------------------------------------------
+# 跨 App 同步登记（幂等）
+# ---------------------------------------------------------------------------
+
+def get_migration(source_key: str, target_source: str) -> dict | None:
+    """取某条源会话同步到某一端的登记记录。"""
+    con = _connect()
+    try:
+        _prepare(con)
+        row = con.execute(
+            "SELECT source_key,target_source,content_hash,target_sid,updated_at "
+            "FROM migrations WHERE source_key=? AND target_source=?",
+            (source_key, target_source),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        con.close()
+
+
+def record_migration(
+    source_key: str, target_source: str, content_hash: str, target_sid: str
+) -> None:
+    """写入/更新同步登记。target_sid 用「索引里的 sid 形式」（WB 含项目 slug）。"""
+    con = _connect()
+    try:
+        _prepare(con)
+        con.execute(
+            "INSERT INTO migrations(source_key,target_source,content_hash,target_sid,updated_at) "
+            "VALUES(?,?,?,?,?) ON CONFLICT(source_key,target_source) DO UPDATE SET "
+            "content_hash=excluded.content_hash, target_sid=excluded.target_sid, "
+            "updated_at=excluded.updated_at",
+            (source_key, target_source, content_hash, target_sid, int(time.time() * 1000)),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def forget_migration(source_key: str, target_source: str) -> None:
+    con = _connect()
+    try:
+        _prepare(con)
+        con.execute(
+            "DELETE FROM migrations WHERE source_key=? AND target_source=?",
+            (source_key, target_source),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def find_same_content(target_source: str, content_hash: str) -> dict | None:
+    """在索引里找目标端同内容的会话（兜底：v0.3.0 及以前同步出来的副本没有登记）。"""
+    con = _connect()
+    try:
+        _prepare(con)
+        row = con.execute(
+            "SELECT key,sid,source FROM sessions WHERE source=? AND dedup_hash=? LIMIT 1",
+            (target_source, content_hash),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        con.close()

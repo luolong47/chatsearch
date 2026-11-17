@@ -398,7 +398,7 @@
     const tips = {
       archive: `归档 ${n} 条会话？\n\n会写入 WorkBuddy 数据库或 DSH 配置（写前自动备份）。\n进行中的会话会被自动跳过。`,
       unarchive: `取消归档 ${n} 条会话？\n\n会写回原生 App（写前自动备份）。\nDSH 侧需要重启应用才能看到变化。`,
-      migrate: `把 ${n} 条会话同步到另一端？\n\nWorkBuddy → DSH，DSH → WorkBuddy。只搬文本对话（提问 + 回复），\n不含工具调用、推理和附件；原会话保持不变，目标端生成新会话。\n进行中的会话会被自动跳过。`,
+      migrate: `把 ${n} 条会话同步到另一端？\n\nWorkBuddy → DSH，DSH → WorkBuddy。只搬文本对话（提问 + 回复），\n不含工具调用、推理和附件；原会话保持不变，目标端生成新会话。\n已经同步过、内容没变化的会跳过，不会重复写入。\n进行中的会话会被自动跳过。`,
     };
     if (!confirm(tips[action] || "确定执行？")) return;
 
@@ -766,7 +766,8 @@
     const ok = confirm(
       `把这条会话复制到 ${label}？\n\n` +
       "只搬文本对话（你的提问 + AI 回复），不含工具调用、推理过程和附件。\n" +
-      `会写入 ${label} 的原生存储（写前自动备份）；原会话保持不变。`
+      `会写入 ${label} 的原生存储（写前自动备份）；原会话保持不变。\n` +
+      "已经同步过、内容没变化的不会重复写入。"
     );
     if (!ok) return;
     const raw = btn.textContent;
@@ -777,6 +778,10 @@
         `/api/migrate?key=${encodeURIComponent(key)}&target=${encodeURIComponent(target)}`,
         { method: "POST" }
       );
+      if (r && r.already) {
+        toast(r.message || "目标端已有这条会话，未重复写入", 7000);
+        return;
+      }
       let msg;
       if (target === "dsh") {
         msg = `已同步到 DSH：${r.messages} 条消息。重启 DSH 后可在会话列表看到它。`;
