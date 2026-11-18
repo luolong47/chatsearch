@@ -29,7 +29,7 @@ Windows 更懒：装好 uv 后双击仓库里的 `启动聊天检索.bat`。只�
 - **归档 / 取消归档**：详情页或批量操作，写回原生 App（写前自动备份）
 - **同步**：转成另一端原生格式并登记进去，之后能在另一个 App 里接着聊。只搬文本对话，不含工具调用、推理、附件
 - **批量**：筛选栏「☑ 批量」→ 勾选 → 底部归档 / 取消归档 / 同步，可混合来源，一次写到底
-- **进行中的会话不能归档、不能同步**：会话文件 5 分钟内被写过，或 WorkBuddy 原生状态为 working
+- **进行中的会话不能归档、不能同步**，判定看三件事：WorkBuddy 每轮对话的 agent 进程心跳（`~/.workbuddy/sessions/<pid>.json`，同时校验 pid 存活与进程创建时间，排除 PID 复用）、会话文件最后一条事件是否已收尾（不是 assistant 的最终回复 = 写到一半）、以及拿不到心跳时退回「未收尾 + 90 秒内写过」。刚聊完的会话立刻可归档；一个跑了半小时的长工具调用也不会被误判成已结束
 - **同步是幂等的**：内容相同不重复写；源端归档状态跟随副本；登记在索引库 `migrations` 表，重建索引不丢
 
 ## 数据
@@ -37,6 +37,7 @@ Windows 更懒：装好 uv 后双击仓库里的 `启动聊天检索.bat`。只�
 | 内容 | 路径 |
 |---|---|
 | WorkBuddy 会话 / 标题归档 | `~/.workbuddy/projects/<slug>/*.jsonl` · `~/.workbuddy/workbuddy.db` |
+| WorkBuddy 运行态 | `~/.workbuddy/sessions/<pid>.json`（每轮对话一个 agent 进程，心跳 10~15 秒一次） |
 | DSH 会话 / 归档 | `~/.dsh/sessions/*/session-*/session.v4.jsonl.zstd` · `~/.dsh/storages/workspace.json` |
 
 全部只读。索引在 `data/index.sqlite3`，删掉自动重建；写入前备份落在 `data/backups/`（每类留最近 20 份）。路径不对就改 `src/chatsearch/config.py` 顶部常量。

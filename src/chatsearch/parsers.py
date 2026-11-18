@@ -24,6 +24,13 @@ _USER_QUERY_RE = re.compile(r"<user_query>(.*?)</user_query>", re.DOTALL)
 # 系统注入块，整段剔除
 _SYSTEM_RE = re.compile(r"<system-reminder.*?</system-reminder>", re.DOTALL)
 
+# 簿记类事件：一轮结束后 App 还会补写用量、文件快照、标题、meta。
+# 判断「这一轮收尾没有」要跳过它们，看最后一个真正的事件。
+_TAIL_BOOKKEEPING = frozenset({
+    "credit-usage", "model-usage", "file-history-snapshot", "session-meta",
+    "ai-title", "resend-fork-notice",
+})
+
 
 def _clean_text(text: str, *, user: bool) -> str:
     """清洗单条消息正文。user 消息优先取 <user_query> 内真实提问。"""
@@ -132,6 +139,7 @@ def parse_workbuddy_file(path: Path, db_meta: dict[str, dict] | None = None) -> 
     # 与 DSH 一致，避免一轮对话被拆成 N 条、信息密度过低。
     turns: list[dict] = []
     current: dict | None = None
+    tail_evt: dict | None = None  # 最后一条非簿记事件，用于判断这一轮是否收尾
 
     def _new_turn() -> dict:
         t = {"user": [], "asst": [], "user_ts": 0, "asst_ts": 0}
@@ -141,6 +149,8 @@ def parse_workbuddy_file(path: Path, db_meta: dict[str, dict] | None = None) -> 
     for obj in _iter_jsonl(path):
         typ = obj.get("type")
         ts = obj.get("timestamp") or 0
+        if typ not in _TAIL_BOOKKEEPING:
+            tail_evt = obj
         if ts:
             if not created:
                 created = ts
@@ -196,6 +206,11 @@ def parse_workbuddy_file(path: Path, db_meta: dict[str, dict] | None = None) -> 
 
     if not msgs:
         return None
+    # 收尾判定：最后一件事是 assistant 的 message → 这一轮答完了。
+    # 停在 reasoning / function_call / message(user) 上 → 生成中，或被强杀在半路。
+    tail_closed = None
+    if tail_evt is not None:
+        tail_closed = tail_evt.get("type") == "message" and tail_evt.get("role") == "assistant"
     entry = db_meta.get(db_sid, {})
     archived = bool(entry.get("archived", False))
     if not title:
@@ -214,6 +229,7 @@ def parse_workbuddy_file(path: Path, db_meta: dict[str, dict] | None = None) -> 
         updated_at=updated,
         native_status=entry.get("status", ""),
         last_active=entry.get("last_active", 0),
+        tail_closed=tail_closed,
     )
 
 
@@ -299,6 +315,7 @@ def parse_dsh_file(path: Path, archived_ids: set[str] | None = None) -> Session 
     # 拆成 N 条、信息密度过低。
     turns: dict[int, dict] = {}
     active_turn = 0  # user/message 事件不带 turn 字段，靠 turn/start 推导当前轮
+    started = ended = 0  # DSH 明写 turn/start 与 turn/end，据此判断最后这一轮收尾没有
 
     def _bucket(turn: int) -> dict:
         return turns.setdefault(
@@ -320,6 +337,10 @@ def parse_dsh_file(path: Path, archived_ids: set[str] | None = None) -> Session 
             cwd = obj.get("cwd", "")
         elif typ == "turn/start":
             active_turn = (obj.get("data") or {}).get("turn") or active_turn
+            started += 1
+        elif typ == "turn/end":
+            # reason.kind 为 completed / aborted，都算这一轮结束
+            ended += 1
         elif typ == "session/title":
             t = (obj.get("data", {}).get("title") or "").strip()
             if t:
@@ -375,6 +396,8 @@ def parse_dsh_file(path: Path, archived_ids: set[str] | None = None) -> Session 
     if not title:
         first = next((m.text for m in msgs if m.role == "user"), "")
         title = (first[:40] + "…") if len(first) > 40 else (first or "未命名会话")
+    # turn/start 多于 turn/end → 最后一轮没走完（生成中，或被强杀）
+    tail_closed = (ended >= started) if started else None
     return Session(
         source=SOURCE_DSH,
         sid=sid,
@@ -384,9 +407,11 @@ def parse_dsh_file(path: Path, archived_ids: set[str] | None = None) -> Session 
         archived=archived,
         created_at=created,
         updated_at=updated,
-        # DSH 没有会话级 status，归档状态即原生状态；进行中靠会话文件 mtime 判定
+        # DSH 没有会话级 status，归档状态即原生状态；也没有进程心跳文件，
+        # 进行中只能靠「turn 没收尾 + 文件新鲜」兜底
         native_status="archived" if archived else "active",
         last_active=updated,
+        tail_closed=tail_closed,
     )
 
 

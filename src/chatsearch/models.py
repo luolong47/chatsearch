@@ -31,6 +31,9 @@ class Session:
     updated_at: int = 0  # 毫秒
     native_status: str = ""  # 原生状态：WorkBuddy 的 sessions.status（active/working/completed/archived）
     last_active: int = 0  # 原生最近活动时间（毫秒），WorkBuddy 的 last_activity_at
+    # 会话文件最后一条有效事件是否已经收尾（assistant 的最终回复）。
+    # True=这一轮已结束；False=写到一半（生成中 / 被杀）；None=不知道（DSH 无此结构）。
+    tail_closed: bool | None = None
 
     @property
     def key(self) -> str:

@@ -29,6 +29,7 @@ from .config import (
     ensure_data_dir,
 )
 from .cdp import reload_workbuddy, unarchive_dsh_via_ui
+from . import runtime
 from .models import Session
 from .parsers import (
     parse_all,
@@ -87,7 +88,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     msg_count   INTEGER NOT NULL DEFAULT 0,
     dedup_hash  TEXT,
     native_status TEXT,
-    last_active INTEGER
+    last_active INTEGER,
+    tail_closed INTEGER
 );
 CREATE TABLE IF NOT EXISTS messages (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -154,6 +156,9 @@ def _prepare(con: sqlite3.Connection) -> None:
         con.execute("ALTER TABLE sessions ADD COLUMN native_status TEXT")
     if cols and "last_active" not in cols:
         con.execute("ALTER TABLE sessions ADD COLUMN last_active INTEGER")
+    # 尾部收尾状态：NULL=不知道（DSH / 旧库），1=这一轮已答完，0=写到一半
+    if cols and "tail_closed" not in cols:
+        con.execute("ALTER TABLE sessions ADD COLUMN tail_closed INTEGER")
 
 
 def _get_meta(con: sqlite3.Connection, key: str) -> str | None:
@@ -245,25 +250,42 @@ def _refresh_archived(con: sqlite3.Connection) -> int:
     return changed
 
 
-# 判定「会话进行中」的时间窗：会话文件在这么多秒内被写过 = App 正在往里追加。
-# 取 5 分钟：足够覆盖"正在一问一答"，又不会把刚操作过的会话长时间锁住。
-IN_PROGRESS_WINDOW_MS = 5 * 60 * 1000
+# 兜底时间窗（只有在拿不到进程心跳时才用，见下）。
+# 尾部未收尾（写到一半）+ 文件这么久内被写过 → 认为还在跑。
+OPEN_TAIL_GRACE_MS = 90 * 1000
+# 尾部状态未知（DSH、老索引）时，只好按文件新鲜度猜。
+UNKNOWN_TAIL_WINDOW_MS = 120 * 1000
+
+# 索引里「尾部状态」的版本标记。老库缺这一列时全量重建一次。
+TAIL_SCHEMA_VERSION = "1"
 
 
 def in_progress_keys(con: sqlite3.Connection, now_ms: int | None = None) -> set[str]:
     """返回「正在进行中」的会话 key 集合。
 
-    规则（两源统一）：
-    - 会话文件在 IN_PROGRESS_WINDOW_MS 内被写过 → App 正在往里追加事件（含生成中）；
-    - 或 WorkBuddy 原生 status 为 working/running（正在生成，可能还没落盘）。
+    判定顺序（前一条成立就不再看后面）：
 
-    不用 last_activity_at 判定：WorkBuddy 的「取消归档」会把该字段刷成当前时间
-    （为了让会话回到侧边栏「最近」顶部），据此判断会把刚恢复的会话误锁 5 分钟。
-    文件 mtime 才是"App 正在写"的真实信号。
+    1. **有活着的 agent 进程**：`~/.workbuddy/sessions/<pid>.json` 里该会话的心跳
+       新鲜、pid 还在、进程创建时间对得上 → 正在生成。这是唯一的一手信号，
+       不依赖任何时间窗，长工具调用跑半小时也不会误判（见 runtime.py）。
+    2. **App 自报 working**：原生 status 为 working/running 且 App 确实在运行
+       （有任意心跳新鲜）。兜住心跳文件还没来得及写的瞬间；App 已经退出时这条
+       不算，否则被强杀的会话会永久锁在 working 上。
+    3. **尾部已收尾**：会话文件最后一条有效事件是 assistant 的最终回复 →
+       这一轮结束了。哪怕文件 1 秒前才被写过、3 秒前才答完，也不算进行中。
+       （旧实现只看 mtime，刚聊完的会话会被白锁 5 分钟。）
+    4. **兜底**：尾部未收尾且 90 秒内被写过；尾部未知（DSH）且 120 秒内被写过。
+       用来识别「生成中但心跳缺失」和「被杀在半路、文件停在 function_call」的区别
+       ——后者时间一过就不再锁。
+
     进行中的会话不允许归档 / 跨 App 同步，避免写坏正在被 App 写入的会话。
     """
     now = now_ms if now_ms is not None else int(time.time() * 1000)
-    out: set[str] = set()
+    try:
+        live, app_up = runtime.snapshot(now)
+    except Exception:  # 心跳目录不可读时退回纯文件兜底，别让功能整块失效
+        live, app_up = frozenset(), False
+
     mtimes = {
         r["session_key"]: r["mtime_ns"]
         for r in con.execute(
@@ -271,14 +293,30 @@ def in_progress_keys(con: sqlite3.Connection, now_ms: int | None = None) -> set[
             "WHERE session_key IS NOT NULL GROUP BY session_key"
         )
     }
-    for row in con.execute("SELECT key,source,native_status FROM sessions"):
-        status = (row["native_status"] or "").lower()
-        if row["source"] == "workbuddy" and status in ("working", "running", "in_progress"):
-            out.add(row["key"])
+    out: set[str] = set()
+    for row in con.execute(
+        "SELECT key,sid,native_status,tail_closed FROM sessions"
+    ):
+        key = row["key"]
+        # 1) 会话 id 匹配活进程（WorkBuddy 的 sid 是 "<slug>/<uuid>"，取尾段）
+        uid = (row["sid"] or "").split("/")[-1]
+        if uid and uid in live:
+            out.add(key)
             continue
-        mt = mtimes.get(row["key"])
-        if mt and now - mt / 1_000_000 < IN_PROGRESS_WINDOW_MS:
-            out.add(row["key"])
+        status = (row["native_status"] or "").lower()
+        if app_up and status in ("working", "running", "in_progress"):
+            out.add(key)
+            continue
+        tail = row["tail_closed"]
+        if tail == 1:
+            continue  # 3) 这一轮已经答完
+        mt = mtimes.get(key)
+        if not mt:
+            continue
+        age_ms = now - mt / 1_000_000
+        window = OPEN_TAIL_GRACE_MS if tail == 0 else UNKNOWN_TAIL_WINDOW_MS
+        if age_ms < window:
+            out.add(key)
     return out
 
 
@@ -313,8 +351,8 @@ def _insert_session_into_index(con: sqlite3.Connection, s: Session) -> None:
     """插入一个会话及其消息，并增量加入 FTS。"""
     con.execute(
         """INSERT INTO sessions(key,source,sid,title,cwd,archived,created_at,updated_at,
-                                msg_count,dedup_hash,native_status,last_active)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                msg_count,dedup_hash,native_status,last_active,tail_closed)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             s.key, s.source, s.sid, s.title, s.cwd, int(s.archived),
             s.created_at, s.updated_at,
@@ -322,6 +360,7 @@ def _insert_session_into_index(con: sqlite3.Connection, s: Session) -> None:
             session_hash(s),
             s.native_status or "",
             s.last_active or 0,
+            None if s.tail_closed is None else int(s.tail_closed),
         ),
     )
     for m in s.sorted_messages():
@@ -356,6 +395,10 @@ def _sync_index_locked() -> dict:
     con = _connect()
     try:
         _prepare(con)
+        # 索引结构升级（旧库没有 tail_closed）：一次性全量重建，把每个会话的
+        # 尾部状态补上。否则老会话永远是「不知道」，只能退回 120 秒窗口兜底。
+        if _get_meta(con, "tail_schema") != TAIL_SCHEMA_VERSION:
+            con.execute("DELETE FROM files")
         # 归档状态变化不体现在文件 mtime 上，每次 sync 都从 db 刷新一遍
         archived_changed = _refresh_archived(con)
         # 首轮（files 表为空）走全量构建
@@ -513,6 +556,7 @@ def _build_full(con: sqlite3.Connection, current: dict[str, tuple[int, int]]) ->
 
     _set_meta(con, "signature", compute_signature())
     _set_meta(con, "built_at", str(int(time.time() * 1000)))
+    _set_meta(con, "tail_schema", TAIL_SCHEMA_VERSION)
     con.commit()
     return {
         "rebuilt": True,
