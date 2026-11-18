@@ -982,6 +982,32 @@ def _backup_sqlite(src: Path, dst: Path) -> None:
         src_con.close()
 
 
+def _wb_variant_ids(con: sqlite3.Connection, sids: list[str]) -> list[str]:
+    """把一条会话在 WorkBuddy 里的所有「同内容副本」展开出来。
+
+    WorkBuddy 按 user_id 给同一段对话各存一行 + 一份 jsonl（换登录态后旧行仍留着），
+    侧边栏只列当前 user_id 的行。只改其中一份的话，App 里看的那份没变，
+    用户就会遇到「点了取消归档但应用里还是没有」。这里按 cwd + created_at + 标题
+    认作同一会话，操作时整组一起改。
+    """
+    base = [s for s in (sids or []) if s]
+    if not base:
+        return []
+    marks = ",".join("?" * len(base))
+    keys = con.execute(
+        f"SELECT DISTINCT cwd, created_at, coalesce(custom_title, title, '') AS t FROM sessions WHERE id IN ({marks})",
+        base,
+    ).fetchall()
+    out: set[str] = set(base)
+    for k in keys:
+        for r in con.execute(
+            "SELECT id FROM sessions WHERE cwd=? AND created_at=? AND coalesce(custom_title, title, '')=?",
+            (k["cwd"], k["created_at"], k["t"]),
+        ):
+            out.add(r["id"])
+    return sorted(out)
+
+
 def _unarchive_workbuddy(
     sid: str,
     db_path: Path = WORKBUDDY_DB,
@@ -1001,25 +1027,37 @@ def _unarchive_workbuddy(
         if row is None:
             return {"ok": False, "error": "WorkBuddy 数据库中找不到该会话"}
         status = (row["status"] or "").lower()
-        if status != "archived":
-            return {"ok": True, "changed": False, "native_status": row["status"]}
         if row["deleted_at"] is not None:
             return {"ok": False, "error": "该会话在 WorkBuddy 中已被删除，未改动"}
+
+        ids = _wb_variant_ids(con, [sid])
+        marks = ",".join("?" * len(ids))
+        pending = [
+            r["id"]
+            for r in con.execute(
+                f"SELECT id FROM sessions WHERE id IN ({marks}) "
+                "AND status='archived' AND deleted_at IS NULL",
+                ids,
+            )
+        ]
+        if not pending:
+            return {"ok": True, "changed": False, "native_status": row["status"]}
 
         backup_dir.mkdir(parents=True, exist_ok=True)
         backup = backup_dir / f"workbuddy-{_backup_stamp()}.db"
         _backup_sqlite(db_path, backup)
 
         now_ms = int(time.time() * 1000)
+        pmarks = ",".join("?" * len(pending))
         # last_activity_at 一起刷新：WorkBuddy 侧边栏「最近」按它排序且只显示少数几条，
         # 只改 status 的话会话虽然回到未归档，仍会沉在几百条之后，用户看不到。
         cur = con.execute(
-            "UPDATE sessions SET status='active', updated_at=?, last_activity_at=? "
-            "WHERE id=? AND status='archived' AND deleted_at IS NULL",
-            (now_ms, now_ms, sid),
+            f"UPDATE sessions SET status='active', updated_at=?, last_activity_at=? "
+            f"WHERE id IN ({pmarks}) AND status='archived' AND deleted_at IS NULL",
+            [now_ms, now_ms, *pending],
         )
         con.commit()
-        if cur.rowcount != 1:
+        if cur.rowcount != len(pending):
             return {
                 "ok": False,
                 "error": "写入未生效（状态可能已被其它进程修改）",
@@ -1030,6 +1068,7 @@ def _unarchive_workbuddy(
             "changed": True,
             "native_status": "active",
             "activity_bumped": True,
+            "variants": len(pending),
             "backup": str(backup),
         }
     finally:
@@ -1203,12 +1242,35 @@ def _archive_workbuddy_many(
         con.execute("PRAGMA busy_timeout=8000")
         marks = ",".join("?" * len(uniq))
         rows = con.execute(
-            f"SELECT id, status, deleted_at FROM sessions WHERE id IN ({marks})", uniq
+            f"SELECT id, cwd, created_at, coalesce(custom_title, title, '') AS t, status, deleted_at "
+            f"FROM sessions WHERE id IN ({marks})",
+            uniq,
         ).fetchall()
         found = {r["id"]: r for r in rows}
+
+        # 同一会话可能按 user_id 存了多份（换登录态后旧行仍留着），侧边栏只列当前
+        # user_id 那份，所以整组一起改，否则用户会觉得「点了没反应」。
+        group_ids: dict[tuple, list[str]] = {}
+        for key in {(r["cwd"], r["created_at"], r["t"]) for r in rows}:
+            group_ids[key] = [
+                x["id"]
+                for x in con.execute(
+                    "SELECT id FROM sessions WHERE cwd=? AND created_at=? AND coalesce(custom_title, title, '')=?",
+                    key,
+                )
+            ]
+        flat = sorted({i for ids in group_ids.values() for i in ids})
+        fmarks = ",".join("?" * len(flat))
+        meta = {
+            r["id"]: r
+            for r in con.execute(
+                f"SELECT id, status, deleted_at FROM sessions WHERE id IN ({fmarks})", flat
+            )
+        } if flat else {}
+
         changed: list[str] = []
         skipped: list[dict] = []
-        targets: list[str] = []
+        targets: set[str] = set()
         for sid in uniq:
             row = found.get(sid)
             if row is None:
@@ -1217,16 +1279,26 @@ def _archive_workbuddy_many(
             if row["deleted_at"] is not None:
                 skipped.append({"sid": sid, "reason": "会话已在 WorkBuddy 中被删除"})
                 continue
-            status = (row["status"] or "").lower()
-            if archived and status == "archived":
-                skipped.append({"sid": sid, "reason": "已是归档状态"})
+            members = [
+                meta[i]
+                for i in group_ids.get((row["cwd"], row["created_at"], row["t"]), [sid])
+                if i in meta and meta[i]["deleted_at"] is None
+            ]
+            if archived:
+                todo = [m["id"] for m in members if (m["status"] or "").lower() != "archived"]
+            else:
+                todo = [m["id"] for m in members if (m["status"] or "").lower() == "archived"]
+            if not todo:
+                skipped.append({
+                    "sid": sid,
+                    "reason": "已是归档状态" if archived else "已是未归档状态",
+                })
                 continue
-            if not archived and status != "archived":
-                skipped.append({"sid": sid, "reason": "已是未归档状态"})
-                continue
-            targets.append(sid)
+            targets.update(todo)
+            changed.append(sid)
 
         if targets:
+            targets = sorted(targets)
             backup_dir.mkdir(parents=True, exist_ok=True)
             backup = backup_dir / f"workbuddy-{_backup_stamp()}.db"
             _backup_sqlite(db_path, backup)
@@ -1254,7 +1326,6 @@ def _archive_workbuddy_many(
                              "状态可能已被其它进程修改",
                     "backup": str(backup) if backup else None,
                 }
-            changed = targets
         return {"ok": True, "changed": changed, "skipped": skipped,
                 "backup": str(backup) if backup else None}
     except Exception as e:  # noqa: BLE001

@@ -1,166 +1,77 @@
 # chatsearch
 
-> 本地聊天记录全文检索。把 **WorkBuddy** 和 **DeepSeek Harness** 的会话统一到一处搜索，跑在你自己的机器上，不联网、不上传。
+本地聊天记录全文检索。把 **WorkBuddy** 和 **DeepSeek Harness** 的会话统一到一处搜——标题、正文、代码块都能命中，只读本地数据，不联网。
 
-Windows 托盘常驻 + 本地网页界面。标题、正文、代码块都能命中，结果里直接高亮。
+Windows 托盘常驻 + 本地网页（<http://127.0.0.1:8765>）。
 
----
+## 装
 
-## 30 秒开跑
-
-需要 [Python 3.11+](https://www.python.org/) 和 [uv](https://docs.astral.sh/uv/getting-started/installation/)。
-
-```bash
-git clone https://github.com/luolong47/chatsearch.git
-cd chatsearch
-uv sync
-uv run python -m chatsearch.tray
-```
-
-托盘区出现**蓝色放大镜**就成功了。左键点它，或直接访问 <http://127.0.0.1:8765>。
-
-Windows 上更懒的办法：装好 uv 后直接双击仓库里的 **`启动聊天检索.bat`**，它自己会 `uv sync` 再拉托盘。
-
-只想开网页、不要托盘：
-
-```bash
-uv run python -m chatsearch.app
-```
-
-### 用 Scoop 装（免 Python 环境）
+**Scoop（免 Python，推荐）**
 
 ```powershell
 scoop bucket add myapps https://github.com/luolong47/myapps
 scoop install myapps/chatsearch
 ```
 
-装的是打包好的单文件 exe，不需要 Python / uv。索引数据放在 scoop 的 `persist` 目录，升级不会丢。
+**源码**（需要 Python 3.11+ 和 [uv](https://docs.astral.sh/uv/)）
 
----
+```bash
+git clone https://github.com/luolong47/chatsearch.git && cd chatsearch
+uv sync && uv run python -m chatsearch.tray
+```
 
-## 它读哪些文件
+Windows 更懒：装好 uv 后双击仓库里的 `启动聊天检索.bat`。只开网页不要托盘用 `uv run python -m chatsearch.app`。
+
+## 用
+
+- **搜**：空格分词，中英混排都能切；侧栏按来源 / 工作目录 / 是否归档过滤
+- **看**：结果按「轮」聚合；详情页右侧刻度导航条直接跳消息；深色浅色一键切
+- **归档 / 取消归档**：详情页或批量操作，写回原生 App（写前自动备份）
+- **同步**：转成另一端原生格式并登记进去，之后能在另一个 App 里接着聊。只搬文本对话，不含工具调用、推理、附件
+- **批量**：筛选栏「☑ 批量」→ 勾选 → 底部归档 / 取消归档 / 同步，可混合来源，一次写到底
+- **进行中的会话不能归档、不能同步**：会话文件 5 分钟内被写过，或 WorkBuddy 原生状态为 working
+- **同步是幂等的**：内容相同不重复写；源端归档状态跟随副本；登记在索引库 `migrations` 表，重建索引不丢
+
+## 数据
 
 | 内容 | 路径 |
 |---|---|
-| WorkBuddy 会话 | `~/.workbuddy/projects/<slug>/<session>.jsonl` |
-| WorkBuddy 标题 / 归档状态 | `~/.workbuddy/workbuddy.db` |
-| DeepSeek Harness 会话 | `~/.dsh/sessions/<workspace>/session-<id>/session.v4.jsonl.zstd` |
-| DSH 归档状态 | `~/.dsh/storages/workspace.json` |
+| WorkBuddy 会话 / 标题归档 | `~/.workbuddy/projects/<slug>/*.jsonl` · `~/.workbuddy/workbuddy.db` |
+| DSH 会话 / 归档 | `~/.dsh/sessions/*/session-*/session.v4.jsonl.zstd` · `~/.dsh/storages/workspace.json` |
 
-**全部只读**，不会改动原始记录。索引落在 `data/index.sqlite3`，删掉会自动重建。
+全部只读。索引在 `data/index.sqlite3`，删掉自动重建；写入前备份落在 `data/backups/`（每类留最近 20 份）。路径不对就改 `src/chatsearch/config.py` 顶部常量。
 
----
+两个坑值得知道：
 
-## 搜法
+- **同一段对话在 WorkBuddy 里可能存了多份**（按登录态各一份 `user_id` 行 + jsonl，侧边栏只列当前账号那份）。归档 / 取消归档会整组一起改，否则改了 App 里没反应。
+- **原生 App 只在启动时读一次列表**。外部改完状态后，WorkBuddy 里要重载界面（`Ctrl+R` 或重开窗口）才看得到；DSH 需要重启应用。
 
-- 空格分词，中英文混排都能切：`托盘 图标`、`markdown 渲染`
-- **标题也参与检索**，不只在正文里翻
-- 侧栏可按 **来源**（WorkBuddy / DSH）、**工作目录**、**是否归档** 过滤
-- 结果按「轮」聚合：同一轮里 assistant 的多条碎片合成一条，不会刷屏
-- 详情页右侧有刻度导航条，点一下直接跳到对应消息
-- 深色 / 浅色主题，右上角一键切
-- 归档的会话可以直接在详情页点 **取消归档** 写回原生应用（写前自动备份到 `data/backups/`，DSH 侧还会重载渲染进程让其立刻刷新）
-- 详情页还有 **同步到 DSH / 同步到 WorkBuddy**：把这条会话转成另一端的原生格式并登记进去，之后就能在另一个 App 里打开、接着聊。只搬文本对话（提问 + 回复），不含工具调用、推理和附件；写前自动备份，原会话不受影响
+## 托盘 / 命令行
 
-### 同步是幂等的
-
-同一条会话对同一端只保留一份副本：
-
-- 已经同步过、内容没变 → 不再写入，提示「已有这条会话，未重复写入」
-- 源端又聊了新内容 → 提示「副本与当前内容不一致」，需要覆盖时才走 `force`（先删旧副本再写新的）
-- 归档状态跟着走：源端已归档，同步出去的副本也落在归档里（WorkBuddy `status=archived` / DSH `archivedSessionIds`）
-- 登记记录落在索引库的 `migrations` 表（`源 key + 目标端 + 内容指纹 + 目标 sid`），索引重建不会清空它
-
-早期版本同步出去的副本没有登记记录，会按「目标端是否已有同内容会话」兜底识别，同样不会重复写入。
-
----
-
-## 批量操作
-
-筛选栏最右边有 **☑ 批量** 按钮。开启后每条会话前出现勾选框，底部浮出操作栏：
-
-| 操作 | 说明 |
-|---|---|
-| 归档 | 在原生 App 里把选中会话置为归档 |
-| 取消归档 | 恢复为未归档（WorkBuddy 会同时把会话顶回侧边栏「最近」） |
-| 同步到另一端 | 按每条会话的来源自动发到对面 App，一次可以混着选 |
-
-批量按来源合并写入：WorkBuddy 一次备份 + 单事务，DSH 一次原子写；全部完成后只重载一次 WorkBuddy 界面、只增量同步一次索引。批量同步整批只备份一次，`data/backups/` 每类最多保留最近 20 份。
-
-批量同步也会跳过已同步过的（内容相同），只在结果里报「跳过 N 条，原因：已同步过」。
-
-**进行中的会话不能归档、不能同步**：卡片会变暗、打上「进行中」标记，勾选框失效，「全选」也会跳过它们。判定规则是「会话文件在最近 5 分钟内被写过」或「WorkBuddy 原生状态是 working」——即 App 正在往这条会话里写数据，此时外部写入会打架。详情页里的归档 / 同步按钮同样遵守这条规则。
-
----
-
-## 托盘菜单
-
-| 项 | 作用 |
-|---|---|
-| 打开检索页面 | 打开浏览器 |
-| 更新索引（增量） | 只处理变动文件，通常不到 1 秒 |
-| 重建索引（全量） | 全部重扫 |
-| 重启服务 | 端口卡住时用 |
-| 打开数据目录 | 定位到 `data/` |
-| 发送到桌面快捷方式 | 在桌面生成 `.lnk` |
-| 开机自动启动 | 勾选即生效，写启动目录 VBS，**不建计划任务、不弹控制台** |
-| 退出 | 停服务并移除图标 |
-
-文件改动由 watchdog 实时监听，正常情况下不需要手动更新。
-
----
-
-## 命令行
+托盘菜单：打开页面 · 更新索引 · 重建索引 · 重启服务 · 打开数据目录 · 桌面快捷方式 · 开机自启 · 退出。文件改动由 watchdog 实时监听，正常无需手动更新。
 
 ```bash
-uv run python -m chatsearch.app --port 9000      # 换端口
-uv run python -m chatsearch.app --no-browser     # 不自动开浏览器
-uv run python -m chatsearch.app --rebuild        # 启动前全量重建
-uv run python -m chatsearch.tray --no-browser    # 托盘：静默启动
+uv run python -m chatsearch.app --port 9000    # 换端口
+uv run python -m chatsearch.app --rebuild      # 启动前全量重建
+uv run python -m chatsearch.tray --no-browser  # 静默启动
 ```
-
----
-
-## 常见问题
-
-**托盘图标找不到？**
-Win11 默认把新图标塞进 `^` 隐藏区。程序启动时会自动写注册表 `IsPromoted=1` 把它提升到常显。
-
-**端口 8765 被占？**
-托盘启动时会自动查 `GetExtendedTcpTable` 并结束占用进程，不需要手动 taskkill。
-
-**索引是空的？**
-说明本机没有 WorkBuddy / DSH 的数据，或路径不同。改 `src/chatsearch/config.py` 顶部的路径常量即可。
-
-**会不会把聊天记录传到网上？**
-不会。服务只绑定 `127.0.0.1`，唯一的网络动作是打开本地页面。
-
-**支持 macOS / Linux？**
-核心检索和网页界面是跨平台的；托盘和开机自启是 Windows 专用实现（纯 Win32），其他平台用 `chatsearch.app` 起网页即可。
-
----
 
 ## 自己打包
 
 ```powershell
-uv sync
-pwsh -File build.ps1
+uv sync; pwsh -File build.ps1
 ```
 
-产物为 `dist\chatsearch.exe`：单文件、无控制台（`--windowed`），可直接拷到任意目录运行，`data\` 会自动建在 exe 同级。
+产物 `dist\chatsearch.exe`：单文件、无控制台，`data\` 建在 exe 同级。打包版入口与源码版一致。
 
-打包版与源码版的入口一致：不带参数起托盘，`chatsearch.exe app --port 9000` 只开网页。
+## 杂项
 
----
+- 托盘图标藏在 `^` 区？启动时自动写注册表提升到常显
+- 端口被占？启动时自动结束占用进程
+- 索引空？本机没有对应数据，或路径不同
+- 会上传吗？不会，只绑 `127.0.0.1`
+- macOS / Linux？检索和网页跨平台，托盘与自启是纯 Win32
 
-## 技术栈
-
-Python 3.11 · sqlite3 FTS5(trigram) · http.server · watchdog · zstandard · 纯手写 Win32 托盘（ctypes，无 pystray）
-
-前端：原生 JS + marked + highlight.js + github-markdown-css，全部本地化，无 CDN 依赖，断网可用。
-
----
-
-## License
+技术栈：Python 3.11 · sqlite3 FTS5(trigram) · http.server · watchdog · zstandard · 纯手写 Win32 托盘；前端原生 JS + marked + highlight.js，全部本地化，断网可用。
 
 MIT

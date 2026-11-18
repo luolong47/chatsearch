@@ -70,18 +70,35 @@ def _load_wb_meta() -> dict[str, dict]:
     try:
         con = sqlite3.connect(f"file:{WORKBUDDY_DB}?mode=ro", uri=True)
         rows = con.execute(
-            "SELECT id, title, custom_title, status, last_activity_at "
+            "SELECT id, cwd, created_at, title, custom_title, status, last_activity_at "
             "FROM sessions WHERE deleted_at IS NULL"
         ).fetchall()
         con.close()
-        for sid, title, custom, status, last_active in rows:
+        # WorkBuddy 会按 user_id 给同一段对话各存一行（换登录态后旧行仍留着），
+        # 侧边栏只列当前 user_id 那份。这里按 cwd + created_at + 标题归组：
+        # 只要有一份不是 archived 就当作未归档，避免拿旧副本的状态误导用户。
+        groups: dict[tuple, dict] = {}
+        for sid, cwd, created, title, custom, status, last_active in rows:
             t = (custom or title or "").strip()
-            meta[sid] = {
-                "title": t,
-                "archived": (status == "archived"),
-                "status": (status or "").lower(),
-                "last_active": int(last_active or 0),
-            }
+            st = (status or "").lower()
+            g = groups.setdefault(
+                (cwd, created, t),
+                {"archived": True, "status": "archived", "last_active": 0, "ids": []},
+            )
+            if st != "archived":
+                g["archived"] = False
+                if g["status"] == "archived":
+                    g["status"] = st
+            g["last_active"] = max(g["last_active"], int(last_active or 0))
+            g["ids"].append(sid)
+        for (_, _, t), g in groups.items():
+            for sid in g["ids"]:
+                meta[sid] = {
+                    "title": t,
+                    "archived": g["archived"],
+                    "status": g["status"],
+                    "last_active": g["last_active"],
+                }
     except Exception:
         pass
     return meta
