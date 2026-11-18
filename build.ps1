@@ -7,6 +7,21 @@ if (-not (Test-Path '.venv\Scripts\python.exe')) {
     throw '未找到 .venv，请先执行 uv sync'
 }
 
+# 版本号有两处：pyproject.toml 的 version（给 scoop 与依赖元数据）
+# 和 config.py 的 APP_VERSION（页面上的版本徽章）。忘同步就会徽章显示旧版本，
+# 所以打包前直接拦下来。
+function Get-VersionFrom($path, $pattern) {
+    $hit = Select-String -Path $path -Pattern $pattern | Select-Object -First 1
+    if (-not $hit) { return $null }
+    return $hit.Matches[0].Groups[1].Value
+}
+$pyVer = Get-VersionFrom 'pyproject.toml' '^version\s*=\s*"([^"]+)"'
+$cfgVer = Get-VersionFrom 'src\chatsearch\config.py' '^APP_VERSION\s*=\s*"([^"]+)"'
+if (-not $pyVer -or $pyVer -ne $cfgVer) {
+    throw "版本号不一致：pyproject.toml=$pyVer，config.py APP_VERSION=$cfgVer"
+}
+Write-Host "[build] 版本 $pyVer"
+
 if (-not (Test-Path 'data\chatsearch.ico')) {
     Write-Host '[build] 生成图标...'
     uv run python -m chatsearch.tray --export-icon

@@ -10,7 +10,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from . import indexer, migrate, watcher
-from .config import DEFAULT_HOST, DEFAULT_PORT
+from .config import APP_VERSION, DEFAULT_HOST, DEFAULT_PORT
 
 def _resolve_static_dir() -> Path:
     """静态资源目录：源码运行取包内 static；PyInstaller 单文件取解包目录。"""
@@ -55,14 +55,35 @@ class APIHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_index(self) -> None:
+        """首页：把版本号填进 HTML 里的 {{VERSION}} 占位。
+
+        静态文件走 SimpleHTTPRequestHandler，没法做模板替换，首页单独读一次。
+        不能让前端去 /api/status 拿版本再回填——那样徽章会先空一下再跳出来。
+        """
+        try:
+            html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+        except OSError:
+            return self.send_error(404, "index.html missing")
+        body = html.replace("{{VERSION}}", APP_VERSION).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
         qs = parse_qs(parsed.query)
 
+        if path in ("/", "/index.html"):
+            return self._send_index()
         if path == "/api/status":
             data = indexer.index_status()
             data["watcher"] = watcher.get_status()
+            data["version"] = APP_VERSION
             return self._send_json(data)
         if path == "/api/rebuild":
             full = qs.get("full", ["0"])[0] in ("1", "true", "yes")

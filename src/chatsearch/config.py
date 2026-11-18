@@ -7,6 +7,10 @@ from pathlib import Path
 
 HOME = Path.home()
 
+# 应用版本号：页面右上角徽章与 /api/status 都用它。
+# 发版时和 pyproject.toml 的 version 一起改，build.ps1 会校验两者一致。
+APP_VERSION = "0.3.4"
+
 # WorkBuddy 会话记录目录：projects/<slug>/<session-id>.jsonl
 WORKBUDDY_PROJECTS = HOME / ".workbuddy" / "projects"
 WORKBUDDY_DB = HOME / ".workbuddy" / "workbuddy.db"  # sessions 表，用于补标题
